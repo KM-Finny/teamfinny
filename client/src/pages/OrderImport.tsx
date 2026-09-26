@@ -1,0 +1,3027 @@
+import { useEffect, useRef, useState } from "react";
+import { useLocation } from "wouter";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import Papa from "papaparse";
+import { hasPageWriteAccess, hasPageViewAccess } from "../lib/permissions";
+import {
+  AlertCircle,
+  CheckCircle,
+  CheckCircle2,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  FileBarChart,
+  FileUp,
+  History,
+  Loader2,
+  MoreVertical,
+  PackageCheck,
+  Pencil,
+  RefreshCw,
+  RotateCcw,
+  ScanLine,
+  Search,
+  StopCircle,
+  Trash2,
+  Upload,
+  X,
+} from "lucide-react";
+import EditCsvDialog from "@/components/modals/EditCsvDialog";
+import ReportsDialog, { type ReportsDialogSession } from "@/components/modals/ReportsDialog";
+import { PlantBadge } from "@/components/PlantBadge";
+import { useAuth } from "@/hooks/use-auth";
+import { usePersistentFilter } from "@/hooks/usePersistentFilter";
+import { Button } from "@/components/ui/button";
+import { buildPageList } from "@/components/ui/data-table";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Badge } from "@/components/ui/badge";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { useToast } from "@/hooks/use-toast";
+import { apiRequest } from "@/lib/queryClient";
+import type { OrderImportSession, OrderImportItem } from "@shared/schema";
+import { SectionSkeleton } from "@/components/ui/loading-skeletons";
+
+// ── Fixed target columns ─────────────────────────────────────────────────────
+const TARGET_FIELDS = [
+  { key: "barcode",         label: "Barcode / SKU" },
+  { key: "itemName",        label: "Item Name" },
+  { key: "sapCode",         label: "SAP Code" },
+  { key: "quantity",        label: "Quantity" },
+  { key: "expectedPallets", label: "Expected Pallets" },
+] as const;
+type TargetKey = (typeof TARGET_FIELDS)[number]["key"];
+type Mapping = Record<TargetKey, string>;
+
+const SKIP = "__skip__";
+
+// Strip BOM and extra whitespace from a CSV header
+function cleanHeader(h: string): string {
+  return h.replace(/^﻿/, "").replace(/[^\x20-\x7E]/g, "").trim();
+}
+
+function autoMatch(headers: string[]): Mapping {
+  // Build a normalised version: lowercase, strip spaces/underscores/special chars
+  const norm = headers.map((h) => h.toLowerCase().replace(/[\s_\-+*]/g, ""));
+
+  const best = (...kws: string[]) => {
+    // 1. exact normalised match
+    for (const kw of kws) {
+      const k = kw.toLowerCase().replace(/[\s_\-+*]/g, "");
+      const i = norm.findIndex((h) => h === k);
+      if (i !== -1) return headers[i];
+    }
+    // 2. starts-with match
+    for (const kw of kws) {
+      const k = kw.toLowerCase().replace(/[\s_\-+*]/g, "");
+      const i = norm.findIndex((h) => h.startsWith(k));
+      if (i !== -1) return headers[i];
+    }
+    // 3. contains match
+    for (const kw of kws) {
+      const k = kw.toLowerCase().replace(/[\s_\-+*]/g, "");
+      const i = norm.findIndex((h) => h.includes(k));
+      if (i !== -1) return headers[i];
+    }
+    return SKIP;
+  };
+
+  return {
+    // barcode: look for barcode, sku, product code, item code, bar code
+    barcode: best(
+      "barcode", "bar code", "bar_code",
+      "sku", "product code", "productcode", "item code", "itemcode",
+      "code", "product_code", "item_no", "itemno", "article"
+    ),
+    // item name: product name, item name, description, product+name combo
+    itemName: best(
+      "product name", "productname", "item name", "itemname",
+      "product+name", "productcode+productname", "description",
+      "name", "item", "product"
+    ),
+    // sap code
+    sapCode: best(
+      "sap code", "sapcode", "sap_code", "sap",
+      "material code", "materialcode", "material no", "materialno"
+    ),
+    // quantity: total column preferred over individual dealer qty
+    quantity: best(
+      "total", "grand total", "sum", "total qty", "total quantity",
+      "quantity", "qty", "boxes", "nos", "pcs", "count", "units"
+    ),
+    // expected pallets
+    expectedPallets: best(
+      "expected pallets", "expectedpallets", "expected pallet",
+      "pallets", "pallet", "plt", "expected"
+    ),
+  };
+}
+
+// ── Unloading mode's own target columns — a distinct field set from TARGET_FIELDS above (adds
+// Vehicle Number, since one unload CSV can span multiple vehicles; no Expected Pallets, unload
+// doesn't track that) — moved here from client/src/pages/Unloading/Unloading.tsx's own import
+// flow, which no longer has one (see this page's "Unloading" mode section further down). ────────
+const UNLOAD_TARGET_FIELDS = [
+  { key: "vehicleNumber", label: "Vehicle Number" },
+  { key: "barcode", label: "Barcode / SKU" },
+  { key: "itemName", label: "Item Name" },
+  { key: "sapCode", label: "SAP Code" },
+  { key: "quantity", label: "Quantity" },
+] as const;
+type UnloadTargetKey = (typeof UNLOAD_TARGET_FIELDS)[number]["key"];
+type UnloadMapping = Record<UnloadTargetKey, string>;
+
+function unloadAutoMatch(headers: string[]): UnloadMapping {
+  const norm = headers.map((h) => h.toLowerCase().replace(/[\s_\-+*]/g, ""));
+  const best = (...kws: string[]) => {
+    for (const kw of kws) {
+      const k = kw.toLowerCase().replace(/[\s_\-+*]/g, "");
+      const i = norm.findIndex((h) => h === k);
+      if (i !== -1) return headers[i];
+    }
+    for (const kw of kws) {
+      const k = kw.toLowerCase().replace(/[\s_\-+*]/g, "");
+      const i = norm.findIndex((h) => h.startsWith(k));
+      if (i !== -1) return headers[i];
+    }
+    for (const kw of kws) {
+      const k = kw.toLowerCase().replace(/[\s_\-+*]/g, "");
+      const i = norm.findIndex((h) => h.includes(k));
+      if (i !== -1) return headers[i];
+    }
+    return SKIP;
+  };
+  const bestExact = (...kws: string[]) => {
+    for (const kw of kws) {
+      const k = kw.toLowerCase().replace(/[\s_\-+*]/g, "");
+      const i = norm.findIndex((h) => h === k);
+      if (i !== -1) return headers[i];
+    }
+    return SKIP;
+  };
+  const quantityMatch = best("total qty", "total quantity", "quantity", "qty", "boxes", "nos", "pcs", "count", "units");
+  return {
+    vehicleNumber: best("vehicle no", "vehicle number", "vehicleno", "vehicle", "truck no", "truckno", "vehicle reg", "vehicle regno"),
+    barcode: best("barcode", "bar code", "bar_code", "sku", "product code", "productcode", "item code", "itemcode", "code"),
+    itemName: best("product name", "productname", "item name", "itemname", "description", "name", "item", "product", "material"),
+    sapCode: best("sap code", "sapcode", "sap_code", "sap", "material code", "materialcode"),
+    quantity: quantityMatch !== SKIP ? quantityMatch : bestExact("total", "grand total"),
+  };
+}
+
+// Decimal-safe qty parsing (a plain digit-strip would turn "200.00" into "20000" by eating the
+// decimal point) — same fix Unloading's own import carried before this moved here.
+function parseUnloadQtyCell(raw: string): number {
+  const n = parseFloat(raw.replace(/,/g, "").trim());
+  return Number.isFinite(n) ? Math.round(n) : 0;
+}
+
+// Mirrors getUserPlants in server/routes/order-scan.ts — null = admin, sees every plant;
+// otherwise exactly the plants assigned on the Users page, lowercased. Used to filter the
+// Unloading-mode Plant picker down to what this user could actually import for.
+function getUserPlantsClient(): string[] | null {
+  let u: any = {};
+  try { u = JSON.parse(localStorage.getItem("currentUser") || "{}"); } catch { /* default {} */ }
+  const role = (u.role ?? "").toLowerCase().trim();
+  if (role === "admin" || role === "super-admin") return null;
+  try {
+    const parsed = typeof u.plants === "string" ? JSON.parse(u.plants) : u.plants;
+    return Array.isArray(parsed) ? parsed.map((p: string) => String(p).toLowerCase().trim()) : [];
+  } catch { return []; }
+}
+
+type ScanSession = {
+  id: number; plant: string; csvFileName: string; rowCount: number;
+  // Ordered totals across this CSV's rows — rowCount is only how many LINES it has, which isn't
+  // what "how big is this order" means. Optional: older responses won't carry them.
+  totalQty?: number; totalPallets?: number;
+  scanStatus: string; importedByName: string | null; createdAt: string | null;
+  // The date this CSV was uploaded FOR (chosen at upload) — distinct from createdAt (when it
+  // was uploaded). All date filters/labels on this page use orderDate.
+  orderDate: string | null;
+  scanActivatedByName: string | null; scanActivatedAt: string | null; scanCompletedAt: string | null;
+  // Who completed the part — a name, "System", or null for parts completed before this was recorded.
+  scanCompletedByName?: string | null;
+  scanActivatedByCode:string | null;
+  // FIFO batch membership — already returned by /api/order-scan/sessions, just wasn't typed
+  // here until Reports needed to know whether to offer group-level (Final/CSV-wise) reports.
+  receivingSessionId: number | null; partIndex: number | null;
+};
+
+// DB stores timestamps in IST (server local time). The pg driver reads them as UTC
+// and JSON serializes with Z, shifting the time by +5:30. To undo this, display
+// using timeZone "UTC" so the raw stored value (= actual IST time) is shown as-is.
+// Display-only: strips a trailing ".csv" from a file name so it reads cleanly in the UI.
+function stripCsvExt(name?: string | null): string {
+  return (name ?? "").replace(/\.csv$/i, "");
+}
+
+function fmtIST(dt: string | Date | null | undefined): string {
+  if (!dt) return "—";
+  const s = dt instanceof Date ? dt.toISOString() : String(dt);
+  const d = new Date(/Z$|[+-]\d{2}:\d{2}$/.test(s) ? s : s.replace(" ", "T") + "Z");
+  if (isNaN(d.getTime())) return "—";
+  // Bug: this used to format with timeZone: "UTC", which just re-displayed the raw stored
+  // digits unchanged and labeled them IST. scan_activated_at/scan_completed_at are written
+  // server-side via `new Date()` through node-postgres into a naive `timestamp` column, which
+  // stores true UTC wall-clock digits (see server/routes/order-scan.ts) — so displaying them
+  // meant this page showed a time exactly 5.5 hours BEHIND the real IST time, while ScanViewer
+  // (elsewhere) converted the same underlying instant correctly, hence the two pages disagreeing.
+  return d.toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
+}
+
+// "Time taken" — wall-clock time from when a session was activated (opened for scanning) to
+// when it was marked complete. A constant timezone offset cancels out in a subtraction, so this
+// doesn't need fmtIST's Asia/Kolkata conversion — plain Date parsing is fine here. Same measure
+// used on Loading's and Unloading's own landing tables.
+function formatDuration(startIso: string | null | undefined, endIso: string | null | undefined): string | null {
+  if (!startIso || !endIso) return null;
+  const ms = new Date(endIso).getTime() - new Date(startIso).getTime();
+  if (!Number.isFinite(ms) || ms < 0) return null;
+  const totalMinutes = Math.round(ms / 60000);
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) return `${days}d ${hours}h`;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  return `${minutes}m`;
+}
+
+function getLocalISODate(date = new Date()): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+export default function OrderImport() {
+  const { toast } = useToast();
+  const qc = useQueryClient();
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [, navigate] = useLocation();
+  const { user } = useAuth();
+  const role = ((user as any)?.role ?? "").toLowerCase();
+  const designation = ((user as any)?.designation ?? "").toLowerCase().trim();
+  const isAdminOrSuper = ["admin", "super-admin"].includes(role);
+  // Page visibility and every write action (Upload, Replace CSV, Delete, Load for Scan,
+  // Deactivate, Reopen) now check ONE thing — the "Order Import" permission granted on the
+  // Users page — admin/super-admin bypass, nothing else. No more Billing-department special
+  // case, no more separate "Scan Order" permission requirement for Activate/Deactivate.
+  const isImportRole = isAdminOrSuper || hasPageViewAccess("order-import");
+  const canWriteOrderImport = isAdminOrSuper || hasPageWriteAccess("order-import");
+  const canDeleteOrderImport = canWriteOrderImport;
+  // Complete is its own rule, unrelated to page write access: anyone can complete a part
+  // EXCEPT designations "Loader"/"Helper"/"Driver"/"Scanner" (exact match) — those are
+  // operational roles who shouldn't be the ones deciding to close an order out. Mirrors
+  // Scan.tsx's canCompletePart and the server's requireCompleteAccess exactly.
+  const canCompleteOrder = isAdminOrSuper || !["loader", "helper", "driver", "scanner"].includes(designation);
+  // The Edit (pencil) button on Available/Active rows follows Order Management itself: the page
+  // grant shows the button, and EditCsvDialog disables its inputs without WRITE access on the
+  // same page. It used to carry a separate "order-import-edit" key for the identical split.
+  const canViewCsvEdit = hasPageViewAccess("order-import");
+
+  // Form state
+  const [plant, setPlant] = useState("");
+  const [orderDate, setOrderDate] = useState(getLocalISODate());
+  // Upload CSV: select one or many files; you Map & Import EACH one in turn (a mapping
+  // dialog per file). All files sharing the same plant + Order Date auto-group into one
+  // FIFO batch server-side (Part 1 loads, the rest auto-advance on complete).
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [isBatchImporting, setIsBatchImporting] = useState(false);
+  // Sequential per-file Map & Import queue.
+  const uploadQueueRef = useRef<File[]>([]);
+  const uploadIdxRef = useRef(0);
+  const uploadCollectedRef = useRef<{ sessionIds: number[]; fileNames: string[]; failed: string[]; totalRows: number; groupId: number | null }>({ sessionIds: [], fileNames: [], failed: [], totalRows: 0, groupId: null });
+  const [uploadProgress, setUploadProgress] = useState<{ current: number; total: number } | null>(null);
+
+  // CSV parse result
+  const [csvData, setCsvData] = useState<{
+    name: string;
+    headers: string[];
+    rows: Record<string, string>[];
+  } | null>(null);
+  const [mapping, setMapping] = useState<Mapping>({
+    barcode: SKIP, itemName: SKIP, sapCode: SKIP, quantity: SKIP, expectedPallets: SKIP,
+  });
+  const [showMappingDialog, setShowMappingDialog] = useState(false);
+
+  // ─── "Unloading" page mode — a second, independent CSV-import + history pane sharing this
+  // page's layout (see the mode switcher in the JSX below). Its own parallel state, entirely
+  // separate from the Order Import state above, since a user could conceivably have either
+  // dialog open in principle (they can't in practice — switching modes doesn't close an open
+  // dialog — but keeping them independent avoids one flow's state leaking into the other's UI). ──
+  const [pageMode, setPageMode] = usePersistentFilter<"order-import" | "unloading">("orderImport:pageMode", "order-import");
+  const [unloadImportPlant, setUnloadImportPlant] = useState("");
+  const [unloadImportDate, setUnloadImportDate] = useState("");
+  const [unloadImportFile, setUnloadImportFile] = useState<File | null>(null);
+  const unloadFileRef = useRef<HTMLInputElement>(null);
+  const [isUnloadImporting, setIsUnloadImporting] = useState(false);
+  const [unloadCsvData, setUnloadCsvData] = useState<{ name: string; headers: string[]; rows: Record<string, string>[] } | null>(null);
+  const [unloadMapping, setUnloadMapping] = useState<UnloadMapping>({
+    vehicleNumber: SKIP, barcode: SKIP, itemName: SKIP, sapCode: SKIP, quantity: SKIP,
+  });
+  const [showUnloadMappingDialog, setShowUnloadMappingDialog] = useState(false);
+
+  // Session view
+  const [showHistory, setShowHistory] = useState(false);
+  const [expandedId, setExpandedId] = useState<number | null>(null);
+  const [itemSearch, setItemSearch] = useState("");
+  const [deleteTarget, setDeleteTarget] = useState<number | null>(null);
+  const [deletePreview, setDeletePreview] = useState<{
+    scannedItemCount: number; scannedQtyTotal: number; extraQtyTotal: number; stockApplied: boolean;
+  } | null>(null);
+  // Plant/Order Date of the session being deleted — captured when the delete dialog opens
+  // (from the row itself), so that if the admin picks "Delete, I'll re-upload" we can
+  // pre-fill the Upload form with the SAME plant/date and jump straight into the mapping
+  // dialog for the corrected file, instead of leaving them to scroll up and re-enter it.
+  const [deleteTargetInfo, setDeleteTargetInfo] = useState<{ plant: string; orderDate: string } | null>(null);
+  // Set right before programmatically opening the file picker after a "Delete, I'll re-upload".
+  // handleFileChange checks this to skip straight to the mapping dialog for the chosen file,
+  // instead of waiting for a separate "Map & Import" click.
+  const reuploadPendingRef = useRef(false);
+  const [deactivateTarget, setDeactivateTarget] = useState<number | null>(null);
+  const [completeTarget, setCompleteTarget] = useState<number | null>(null);
+  const [lastImport, setLastImport] = useState<{ rowCount: number } | null>(null);
+  // Session id whose "Edit CSV" dialog is open — set from the Edit button on an Available/
+  // Active row, cleared when the dialog closes.
+  const [editSessionId, setEditSessionId] = useState<number | null>(null);
+  // Reports live entirely inside Order Management now — no separate /order-reports page.
+  // Opens the Reports dialog right here so an operator mid-upload/scan-review never leaves
+  // this page just to check a report.
+  const [reportsSession, setReportsSession] = useState<ReportsDialogSession | null>(null);
+  const openReports = (s: { id: number; csvFileName: string; plant: string; receivingSessionId?: number | null; partIndex?: number | null }) => {
+    setReportsSession({
+      id: s.id, csvFileName: s.csvFileName, plant: s.plant,
+      receivingSessionId: s.receivingSessionId, partIndex: s.partIndex,
+    });
+  };
+
+  // Server-side pagination + date filter (default empty = show all, avoids UTC/IST mismatch)
+  const todayStr = getLocalISODate();
+  // A brand-new order's date can be up to 2 days in the past (yesterday, day-before-yesterday)
+  // — matches the server's own allowance in POST /order-import/sessions. Used as both the date
+  // picker's min= and the threshold below for when the past-date existing-order check kicks in.
+  const earliestOrderDateStr = getLocalISODate(new Date(Date.now() - 2 * 24 * 60 * 60 * 1000));
+  // Browse/lookup filters below are persisted for the sitting. The CSV UPLOAD form's own plant
+  // and Order Date (above) deliberately are NOT — pre-filling the destination of an import from
+  // a previous sitting invites importing a file against the wrong plant/date.
+  const [pageSize, setPageSize] = usePersistentFilter("orderImport:pageSize", 10);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [filterDate, setFilterDate] = usePersistentFilter("orderImport:filterDate", "");
+  const [filterPlant, setFilterPlant] = usePersistentFilter("orderImport:filterPlant", "");
+  // Plant tab row under the status tabs. "" = All. Tabs are derived from the sessions actually
+  // present in the current status tab, so they appear and disappear with the data.
+  const [plantTab, setPlantTab] = usePersistentFilter("orderImport:plantTab", "");
+
+  // Load CSV for Scan — plant and date filters (default empty = server last-48h window)
+  const [scanPlant, setScanPlant] = usePersistentFilter("orderImport:scanPlant", "");
+  const [scanDate, setScanDate] = usePersistentFilter("orderImport:scanDate", todayStr);
+  const [scanExpandedId, setScanExpandedId] = useState<number | null>(null);
+  const [scanItemSearch, setScanItemSearch] = usePersistentFilter("orderImport:scanItemSearch", "");
+
+  // Currently Active card — own plant/date filters
+  const [activePlant, setActivePlant] = usePersistentFilter("orderImport:activePlant", "");
+  const [activeDate, setActiveDate] = usePersistentFilter("orderImport:activeDate", "");
+
+  // Completed Sessions card — collapsed by default. No plant filter: the Completed tab now always
+  // shows every plant's latest completion at once (see completedScanSessions below).
+  const [showCompleted, setShowCompleted] = useState(false);
+
+  // Live-sync transport status. A successful WS handshake (joined-import) only
+  // proves the upgrade succeeded — it does NOT prove that spontaneous server-push
+  // frames will actually reach us. Some reverse proxies (IIS ARR in production)
+  // keep the socket open but buffer/drop later pushes, so a client can think it
+  // is "connected" yet never receive an import-update. Therefore we keep a brisk
+  // safety-net poll even when connected (8s) instead of trusting push alone; if
+  // the socket truly drops we fall back to fast polling (2.5s).
+  const [wsConnected, setWsConnected] = useState(false);
+  const SYNC_INTERVAL = wsConnected ? 8_000 : 2_500;
+
+  // ── Queries ────────────────────────────────────────────────────────────────
+  type SessionsResponse = {
+    sessions: (OrderImportSession & { importedByName: string | null; scanStatus: string; orderDate: string | null })[];
+    total: number;
+    page: number;
+    pageSize: number;
+    totalPages: number;
+  };
+
+  const sessionsQuery = useQuery<SessionsResponse>({
+    queryKey: ["/api/order-import/sessions", currentPage, pageSize, filterDate, filterPlant],
+    queryFn: async ({ signal }) => {
+      const params = new URLSearchParams({
+        page: String(currentPage),
+        pageSize: String(pageSize),
+      });
+      if (filterDate)  params.set("date",  filterDate);
+      if (filterPlant) params.set("plant", filterPlant);
+      return (await apiRequest("GET", `/api/order-import/sessions?${params}`, undefined, undefined, false, signal)).json();
+    },
+    staleTime: 0,
+    refetchInterval: SYNC_INTERVAL,
+    refetchIntervalInBackground: true,
+    refetchOnMount: true,
+    refetchOnWindowFocus: true,
+    // Keep showing the last-known list while a poll/refresh is in flight — without this, some
+    // refetch paths can briefly report no data, which flashes the "Loading…" state instead of
+    // quietly updating the numbers once the new data arrives.
+    placeholderData: (previousData) => previousData,
+  });
+
+  // Warns before a brand-new order gets an Order Date more than 2 days in the past (the server
+  // only accepts one that far back when it's a late part joining/reclaiming an existing group
+  // for that exact plant+date — never for a genuinely new one). Only runs once both fields are
+  // filled and the date is actually past the allowance, so it never fires for today, yesterday,
+  // or the day before.
+  const isPastOrderDate = !!orderDate && orderDate < earliestOrderDateStr;
+  const pastDateCheckQuery = useQuery<{ exists: boolean }>({
+    queryKey: ["/api/order-import/sessions/date-check", plant, orderDate],
+    queryFn: async () =>
+      (await apiRequest("GET", `/api/order-import/sessions/date-check?plant=${encodeURIComponent(plant)}&date=${orderDate}`)).json(),
+    enabled: isPastOrderDate && !!plant.trim(),
+  });
+  const isPastDateBlocked = isPastOrderDate && !!plant.trim() && pastDateCheckQuery.data?.exists === false;
+
+  const itemsQuery = useQuery<OrderImportItem[]>({
+    queryKey: ["/api/order-import/items", expandedId],
+    queryFn: async () =>
+      (await apiRequest("GET", `/api/order-import/sessions/${expandedId}/items`)).json(),
+    enabled: expandedId !== null,
+  });
+
+  const scanItemsQuery = useQuery<OrderImportItem[]>({
+    queryKey: ["/api/order-import/items", scanExpandedId, "scan"],
+    queryFn: async () =>
+      (await apiRequest("GET", `/api/order-import/sessions/${scanExpandedId}/items`)).json(),
+    enabled: scanExpandedId !== null,
+  });
+
+  const plantsQuery = useQuery<{ name: string; bgColor?: string; textColor?: string; borderColor?: string }[]>({
+    queryKey: ["/api/plants"],
+    queryFn: async () => (await apiRequest("GET", "/api/plants")).json(),
+  });
+
+  const scanSessionsQuery = useQuery<ScanSession[]>({
+    queryKey: ["/api/order-scan/sessions"],
+    queryFn: async ({ signal }) =>
+      (await apiRequest("GET", "/api/order-scan/sessions", undefined, undefined, false, signal)).json(),
+    enabled: isImportRole,
+    staleTime: 0,
+    refetchInterval: SYNC_INTERVAL,
+    refetchIntervalInBackground: true,
+    refetchOnMount: true,
+    refetchOnWindowFocus: true,
+    // Same as sessionsQuery above — keeps Available/Active/Completed showing their last-known
+    // rows through every background poll instead of flashing a loading state.
+    placeholderData: (previousData) => previousData,
+  });
+
+  // Active session — uses /active endpoint which has NO date filter whatsoever,
+  // so it always finds whichever session is currently running regardless of when it was loaded.
+  const activeSessionQuery = useQuery<ScanSession | null>({
+    queryKey: ["/api/order-scan/active"],
+    queryFn: async ({ signal }) =>
+      (await apiRequest("GET", "/api/order-scan/active", undefined, undefined, false, signal)).json(),
+    enabled: isImportRole,
+    staleTime: 0,
+    refetchInterval: SYNC_INTERVAL,
+    refetchIntervalInBackground: true,
+    refetchOnMount: true,
+    refetchOnWindowFocus: true,
+    placeholderData: (previousData) => previousData,
+  });
+
+  // ── WebSocket: real-time sync ──────────────────────────────────────────────
+  // Reuses the existing /ws/order-scan WebSocket server with a "join-import"
+  // subscription type so the OrderImport page receives instant push updates
+  // whenever any CSV is uploaded, session status changes, etc.
+  // Polling (refetchInterval:5000) stays as a fallback if the WS drops.
+  useEffect(() => {
+    if (!isImportRole) return;
+
+    let ws: WebSocket | null = null;
+    let retryMs = 2000;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    let mounted = true;
+    let lastMsgAt = Date.now();
+
+    const refetchAll = () => {
+      qc.refetchQueries({ queryKey: ["/api/order-import/sessions"], type: "all" });
+      qc.refetchQueries({ queryKey: ["/api/order-scan/sessions"],   type: "all" });
+      qc.refetchQueries({ queryKey: ["/api/order-scan/active"],     type: "all" });
+      qc.refetchQueries({ queryKey: ["/api/order-scan/notification"], type: "all" });
+    };
+
+    // Dead-connection detector: if no message (including server pings) for 55s, reconnect
+    const deadTimer = setInterval(() => {
+      if (ws && Date.now() - lastMsgAt > 55_000) {
+        ws.close();
+      }
+    }, 10_000);
+
+    const connect = () => {
+      if (!mounted) return;
+      const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+      ws = new WebSocket(`${proto}//${window.location.host}/ws/order-scan`);
+
+      ws.onopen = () => {
+        retryMs = 2000;
+        lastMsgAt = Date.now();
+        console.log("[WS:OrderImport] Connected to /ws/order-scan");
+        ws!.send(JSON.stringify({ type: "join-import" }));
+      };
+
+      ws.onmessage = (e) => {
+        lastMsgAt = Date.now();
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg.type === "joined-import") {
+            console.log("[WS:OrderImport] Subscribed to import events ✓");
+            // Only now is the push channel confirmed working — slow the polling
+            // fallback down to a safety-net interval.
+            setWsConnected(true);
+          } else if (msg.type === "import-update") {
+            console.log("[WS:OrderImport] Received import-update — refetching queries");
+            refetchAll();
+          }
+          // "ping" is a keepalive — no action needed
+        } catch { /* ignore malformed */ }
+      };
+
+      ws.onerror = () => { /* onclose fires next */ };
+
+      ws.onclose = () => {
+        ws = null;
+        if (!mounted) return;
+        // Push channel is down — resume fast polling so users still see updates.
+        setWsConnected(false);
+        console.log(`[WS:OrderImport] Disconnected — reconnecting in ${retryMs}ms`);
+        retryTimer = setTimeout(() => {
+          retryMs = Math.min(retryMs * 2, 30_000);
+          connect();
+        }, retryMs);
+      };
+    };
+
+    connect();
+
+    return () => {
+      mounted = false;
+      clearInterval(deadTimer);
+      if (retryTimer) clearTimeout(retryTimer);
+      ws?.close();
+    };
+  }, [isImportRole, qc]);
+
+  // ── Mutations ──────────────────────────────────────────────────────────────
+  type ImportSessionRow = OrderImportSession & { importedByName: string | null; scanStatus: string };
+
+  // Patch every cached page of the paginated import-sessions list immediately.
+  const patchImportSessions = (updater: (rows: ImportSessionRow[]) => ImportSessionRow[]) => {
+    qc.getQueriesData<SessionsResponse>({ queryKey: ["/api/order-import/sessions"] })
+      .forEach(([key, data]) => {
+        if (!data) return;
+        qc.setQueryData<SessionsResponse>(key, { ...data, sessions: updater(data.sessions) });
+      });
+  };
+
+  // After every mutation fire immediate refetches. SSE usually beats this, but
+  // onSettled is a guaranteed belt-and-suspenders fallback.
+  const refetchAllSessionQueries = () => {
+    qc.refetchQueries({ queryKey: ["/api/order-import/sessions"], type: "all" });
+    qc.refetchQueries({ queryKey: ["/api/order-scan/sessions"],   type: "all" });
+    qc.refetchQueries({ queryKey: ["/api/order-scan/active"],     type: "all" });
+    qc.refetchQueries({ queryKey: ["/api/order-scan/notification"], type: "all" });
+    qc.invalidateQueries({ queryKey: ["/api/order-import/master-view"] });
+  };
+
+  const importMutation = useMutation({
+    mutationFn: async (payload: { plant: string; csvFileName: string; items: object[] }) =>
+      (await apiRequest("POST", "/api/order-import/sessions", payload)).json(),
+    onSuccess: (data) => {
+      setShowMappingDialog(false);
+      setCsvData(null);
+      setSelectedFiles([]);
+      setLastImport({ rowCount: data.rowCount });
+      setShowHistory(true);
+      setCurrentPage(1);
+      setFilterDate("");
+      setFilterPlant("");
+
+      // Optimistic update: show the new session immediately in both lists
+      // while the SSE-triggered refetch confirms server state in the background.
+      if (data.session) {
+        const newRow: ImportSessionRow = {
+          ...data.session,
+          rowCount:       data.rowCount,
+          scanStatus:     data.session.scanStatus ?? "available",
+          importedByName: (user as any)?.name ?? null,
+        };
+        patchImportSessions((rows) => [newRow, ...rows]);
+
+        // Seed page-1/no-filter key so the list renders instantly even if the
+        // user was on a filtered page before uploading.
+        const p1Key = ["/api/order-import/sessions", 1, pageSize, "", ""] as const;
+        const p1 = qc.getQueryData<SessionsResponse>(p1Key);
+        qc.setQueryData<SessionsResponse>(p1Key, p1
+          ? { ...p1, sessions: [newRow, ...p1.sessions].slice(0, pageSize), total: p1.total + 1, totalPages: Math.max(1, Math.ceil((p1.total + 1) / pageSize)) }
+          : { sessions: [newRow], total: 1, page: 1, pageSize, totalPages: 1 },
+        );
+
+        qc.setQueryData<ScanSession[]>(["/api/order-scan/sessions"], (old) =>
+          old ? [{ id: data.session.id, plant: data.session.plant, csvFileName: data.session.csvFileName, rowCount: data.rowCount, scanStatus: data.session.scanStatus ?? "available", importedByName: (user as any)?.name ?? null, createdAt: data.session.createdAt ?? new Date().toISOString(), orderDate: data.session.orderDate ?? orderDate ?? null, scanActivatedByName: null, scanActivatedAt: null, scanCompletedAt: null, scanActivatedByCode: null, receivingSessionId: data.session.receivingSessionId ?? null, partIndex: data.session.partIndex ?? null }, ...old] : [],
+        );
+      }
+
+      if (data.replacesSessionId) {
+        const carried = data.remapSummary?.itemsCarriedForward ?? 0;
+        toast({
+          title: "Linked as replacement",
+          description: carried > 0
+            ? `${carried} previously scanned item(s) were carried forward from the deleted CSV.`
+            : `Replaces the deleted CSV for this plant/date — no prior scans to carry forward.`,
+          className: "bg-green-50 border-green-200 text-green-900",
+        });
+      }
+
+      toast({ title: "Import complete", description: `${data.rowCount} rows imported.`, className: "bg-green-50 border-green-200 text-green-900" });
+    },
+    onError: (err: any) =>
+      toast({ title: "Import failed", description: err.message, variant: "destructive" }),
+    onSettled: () => refetchAllSessionQueries(),
+  });
+
+  const loadForScanMutation = useMutation({
+    mutationFn: async (id: number) =>
+      (await apiRequest("POST", `/api/order-scan/sessions/${id}/activate`)).json(),
+    onMutate: async (id) => {
+      await Promise.all([
+        qc.cancelQueries({ queryKey: ["/api/order-import/sessions"] }),
+        qc.cancelQueries({ queryKey: ["/api/order-scan/sessions"] }),
+        qc.cancelQueries({ queryKey: ["/api/order-scan/active"] }),
+        qc.cancelQueries({ queryKey: ["/api/order-scan/notification"] }),
+      ]);
+      const prevScanSessions  = qc.getQueryData<ScanSession[]>(["/api/order-scan/sessions"]);
+      const prevImportPages   = qc.getQueriesData<SessionsResponse>({ queryKey: ["/api/order-import/sessions"] });
+      const prevActive        = qc.getQueryData<ScanSession | null>(["/api/order-scan/active"]);
+      const prevNotif         = qc.getQueryData(["/api/order-scan/notification"]);
+      const activatingSession = (prevScanSessions ?? []).find((s) => s.id === id);
+      patchImportSessions((rows) => rows.map((s) => s.id === id ? { ...s, scanStatus: "active" } : s));
+      qc.setQueryData<ScanSession[]>(["/api/order-scan/sessions"], (old) =>
+        old ? old.map((s) => s.id === id ? { ...s, scanStatus: "active" } : s) : old,
+      );
+      if (activatingSession) {
+        qc.setQueryData<ScanSession | null>(["/api/order-scan/active"], { ...activatingSession, scanStatus: "active" });
+        // Seed the notification cache immediately so the /scan page sees the active
+        // session as soon as it mounts — no network round-trip needed.
+        qc.setQueryData(["/api/order-scan/notification"], {
+          active: true,
+          session: {
+            id:              activatingSession.id,
+            plant:           activatingSession.plant,
+            csvFileName:     activatingSession.csvFileName,
+            rowCount:        activatingSession.rowCount,
+            importedByName:  activatingSession.importedByName,
+            scanActivatedAt: new Date().toISOString(),
+          },
+        });
+      }
+      return { prevScanSessions, prevImportPages, prevActive, prevNotif };
+    },
+    onSuccess: () => {
+      navigate("/scan");
+    },
+    onError: (err: any, _id, ctx) => {
+      if (ctx) {
+        if (ctx.prevScanSessions !== undefined)
+          qc.setQueryData<ScanSession[]>(["/api/order-scan/sessions"], ctx.prevScanSessions);
+        ctx.prevImportPages.forEach(([key, data]) => { if (data) qc.setQueryData<SessionsResponse>(key, data); });
+        if (ctx.prevActive !== undefined)
+          qc.setQueryData<ScanSession | null>(["/api/order-scan/active"], ctx.prevActive);
+        if (ctx.prevNotif !== undefined)
+          qc.setQueryData(["/api/order-scan/notification"], ctx.prevNotif);
+      }
+      // Parse structured 409 conflict response: "409: {message, conflictFileName}"
+      let title = "Cannot load for scan";
+      let description: string = err?.message ?? "Something went wrong";
+      try {
+        const jsonStr = String(err?.message ?? "").replace(/^\d+:\s*/, "");
+        const parsed = JSON.parse(jsonStr);
+        if (parsed.message) description = parsed.message;
+        if (parsed.conflictFileName) description += ` — deactivate "${parsed.conflictFileName}" first.`;
+      } catch { /* use raw message */ }
+      toast({ title, description, variant: "destructive" });
+    },
+    onSettled: () => refetchAllSessionQueries(),
+  });
+
+  // Fetches the scanned-item/stock counts shown in the delete confirmation dialog, so the
+  // admin knows how much will be reversed before confirming. Falls back to opening the
+  // dialog with generic copy if the preview call itself fails.
+  const deletePreviewMutation = useMutation({
+    mutationFn: async (id: number) =>
+      (await apiRequest("GET", `/api/order-import/sessions/${id}/delete-preview`)).json(),
+    onSuccess: (data, id) => {
+      setDeletePreview(data);
+      setDeleteTarget(id);
+    },
+    onError: (_err: any, id) => {
+      setDeletePreview(null);
+      setDeleteTarget(id);
+    },
+  });
+
+  const deleteMutation = useMutation({
+    mutationFn: async ({ id, mode }: { id: number; mode: "replace" | "discard" }) =>
+      (await apiRequest("DELETE", `/api/order-import/sessions/${id}?mode=${mode}`)).json(),
+    onMutate: async ({ id }: { id: number; mode: "replace" | "discard" }) => {
+      await Promise.all([
+        qc.cancelQueries({ queryKey: ["/api/order-import/sessions"] }),
+        qc.cancelQueries({ queryKey: ["/api/order-scan/sessions"] }),
+        qc.cancelQueries({ queryKey: ["/api/order-scan/active"] }),
+        qc.cancelQueries({ queryKey: ["/api/order-scan/notification"] }),
+      ]);
+      const previousScanSessions = qc.getQueryData<ScanSession[]>(["/api/order-scan/sessions"]);
+      const previousImportPages  = qc.getQueriesData<SessionsResponse>({ queryKey: ["/api/order-import/sessions"] });
+      const previousActive       = qc.getQueryData<ScanSession | null>(["/api/order-scan/active"]);
+      const previousNotif        = qc.getQueryData(["/api/order-scan/notification"]);
+      setDeleteTarget(null);
+      setDeletePreview(null);
+      if (expandedId === id)     setExpandedId(null);
+      if (scanExpandedId === id) setScanExpandedId(null);
+      patchImportSessions((rows) => rows.filter((s) => s.id !== id));
+      qc.setQueryData<ScanSession[]>(["/api/order-scan/sessions"], (old) =>
+        old ? old.filter((s) => s.id !== id) : old,
+      );
+      if (previousActive?.id === id) {
+        qc.setQueryData(["/api/order-scan/active"], null);
+        qc.setQueryData(["/api/order-scan/notification"], { active: false, session: null });
+      }
+      toast({ title: "Session deleted" });
+      return { previousScanSessions, previousImportPages, previousActive, previousNotif };
+    },
+    onError: (err: any, _, context) => {
+      if (context) {
+        if (context.previousScanSessions !== undefined)
+          qc.setQueryData<ScanSession[]>(["/api/order-scan/sessions"], context.previousScanSessions);
+        context.previousImportPages.forEach(([key, data]) => {
+          if (data) qc.setQueryData<SessionsResponse>(key, data);
+        });
+        if (context.previousActive !== undefined)
+          qc.setQueryData<ScanSession | null>(["/api/order-scan/active"], context.previousActive);
+        if (context.previousNotif !== undefined)
+          qc.setQueryData(["/api/order-scan/notification"], context.previousNotif);
+      }
+      toast({ title: "Delete failed", description: err.message, variant: "destructive" });
+    },
+    onSuccess: (data) => {
+      if (!(data?.scannedItemCount > 0)) return;
+      if (data.mode === "discard") {
+        toast({
+          title: "CSV removed",
+          description: `${data.scannedItemCount} scanned item(s) reverted${data.stockReversed?.length ? " and stock rolled back" : ""}. Your next upload for this plant/date will be treated as a new file.`,
+        });
+      } else {
+        toast({
+          title: "CSV deleted",
+          description: `${data.scannedItemCount} scanned item(s) held. Upload the corrected CSV for this plant/date and these scans will be carried forward automatically.`,
+        });
+      }
+    },
+    onSettled: () => refetchAllSessionQueries(),
+  });
+
+  const deactivateMutation = useMutation({
+    mutationFn: async (id: number) =>
+      (await apiRequest("POST", `/api/order-scan/sessions/${id}/deactivate`)).json(),
+    onMutate: async (id) => {
+      await Promise.all([
+        qc.cancelQueries({ queryKey: ["/api/order-import/sessions"] }),
+        qc.cancelQueries({ queryKey: ["/api/order-scan/sessions"] }),
+        qc.cancelQueries({ queryKey: ["/api/order-scan/active"] }),
+        qc.cancelQueries({ queryKey: ["/api/order-scan/notification"] }),
+      ]);
+      const previousScanSessions = qc.getQueryData<ScanSession[]>(["/api/order-scan/sessions"]);
+      const previousImportPages  = qc.getQueriesData<SessionsResponse>({ queryKey: ["/api/order-import/sessions"] });
+      const previousActive       = qc.getQueryData<ScanSession | null>(["/api/order-scan/active"]);
+      const previousNotif        = qc.getQueryData(["/api/order-scan/notification"]);
+      setDeactivateTarget(null);
+      patchImportSessions((rows) => rows.map((s) => s.id === id ? { ...s, scanStatus: "available" } : s));
+      qc.setQueryData<ScanSession[]>(["/api/order-scan/sessions"], (old) =>
+        old ? old.map((s) => s.id === id ? { ...s, scanStatus: "available" } : s) : old,
+      );
+      if (previousActive?.id === id) {
+        qc.setQueryData(["/api/order-scan/active"], null);
+        qc.setQueryData(["/api/order-scan/notification"], { active: false, session: null });
+      }
+      toast({ title: "Session deactivated", description: "Lock released. Another session can now be loaded." });
+      return { previousScanSessions, previousImportPages, previousActive, previousNotif };
+    },
+    onError: (err: any, _, context) => {
+      if (context) {
+        if (context.previousScanSessions !== undefined)
+          qc.setQueryData<ScanSession[]>(["/api/order-scan/sessions"], context.previousScanSessions);
+        context.previousImportPages.forEach(([key, data]) => {
+          if (data) qc.setQueryData<SessionsResponse>(key, data);
+        });
+        if (context.previousActive !== undefined)
+          qc.setQueryData<ScanSession | null>(["/api/order-scan/active"], context.previousActive);
+        if (context.previousNotif !== undefined)
+          qc.setQueryData(["/api/order-scan/notification"], context.previousNotif);
+      }
+      toast({ title: "Deactivate failed", description: err.message, variant: "destructive" });
+    },
+    onSettled: () => refetchAllSessionQueries(),
+  });
+
+  const completeMutation = useMutation({
+    mutationFn: async (id: number) =>
+      (await apiRequest("POST", `/api/order-scan/sessions/${id}/complete`)).json(),
+    onMutate: async (id) => {
+      await Promise.all([
+        qc.cancelQueries({ queryKey: ["/api/order-import/sessions"] }),
+        qc.cancelQueries({ queryKey: ["/api/order-scan/sessions"] }),
+        qc.cancelQueries({ queryKey: ["/api/order-scan/active"] }),
+        qc.cancelQueries({ queryKey: ["/api/order-scan/notification"] }),
+      ]);
+      const previousScanSessions = qc.getQueryData<ScanSession[]>(["/api/order-scan/sessions"]);
+      const previousImportPages  = qc.getQueriesData<SessionsResponse>({ queryKey: ["/api/order-import/sessions"] });
+      const previousActive       = qc.getQueryData<ScanSession | null>(["/api/order-scan/active"]);
+      const previousNotif        = qc.getQueryData(["/api/order-scan/notification"]);
+      setCompleteTarget(null);
+      setShowCompleted(true);
+      patchImportSessions((rows) => rows.map((s) => s.id === id ? { ...s, scanStatus: "completed" } : s));
+      qc.setQueryData<ScanSession[]>(["/api/order-scan/sessions"], (old) =>
+        old ? old.map((s) => s.id === id ? { ...s, scanStatus: "completed" } : s) : old,
+      );
+      if (previousActive?.id === id) {
+        qc.setQueryData(["/api/order-scan/active"], null);
+        qc.setQueryData(["/api/order-scan/notification"], { active: false, session: null });
+      }
+      toast({ title: "Session completed", className: "bg-green-50 border-green-200 text-green-900" });
+      return { previousScanSessions, previousImportPages, previousActive, previousNotif };
+    },
+    onError: (err: any, _, context) => {
+      if (context) {
+        if (context.previousScanSessions !== undefined)
+          qc.setQueryData<ScanSession[]>(["/api/order-scan/sessions"], context.previousScanSessions);
+        context.previousImportPages.forEach(([key, data]) => {
+          if (data) qc.setQueryData<SessionsResponse>(key, data);
+        });
+        if (context.previousActive !== undefined)
+          qc.setQueryData<ScanSession | null>(["/api/order-scan/active"], context.previousActive);
+        if (context.previousNotif !== undefined)
+          qc.setQueryData(["/api/order-scan/notification"], context.previousNotif);
+      }
+      toast({ title: "Complete failed", description: err.message, variant: "destructive" });
+    },
+    onSettled: () => refetchAllSessionQueries(),
+  });
+
+  // Undo an accidental Complete click. Server enforces the real rule (only the most recently
+  // completed session per plant is eligible) — the button is also only ever shown for that one
+  // session (see lastCompletedIdByPlant below), so a 400 here should be rare, not the normal path.
+  const reopenMutation = useMutation({
+    mutationFn: async (id: number) =>
+      (await apiRequest("POST", `/api/order-scan/sessions/${id}/reopen`)).json(),
+    onSuccess: () => {
+      toast({ title: "Session reopened", description: "Scanning can continue on it now.", className: "bg-green-50 border-green-200 text-green-900" });
+    },
+    onError: (err: any) => {
+      toast({ title: "Reopen failed", description: err.message, variant: "destructive" });
+    },
+    onSettled: () => refetchAllSessionQueries(),
+  });
+
+  if (!isImportRole) {
+    return (
+      <main className="min-h-screen bg-gray-50 flex items-center justify-center p-8">
+        <div className="text-center">
+          <div className="flex h-12 w-12 items-center justify-center rounded-full bg-red-100 mx-auto mb-4">
+            <FileUp className="h-6 w-6 text-red-500" />
+          </div>
+          <h2 className="text-lg font-semibold text-gray-900">Access Denied</h2>
+          <p className="mt-1 text-sm text-gray-500">You don't have permission to access Order Import.</p>
+        </div>
+      </main>
+    );
+  }
+
+  // ── Handlers ───────────────────────────────────────────────────────────────
+
+  // Parses raw arrays first so we can find the real header row — Excel pivot-table
+  // exports often have a report-title row before the actual headers. Shared by the
+  // single-file review flow (parseAndOpen) and the automatic multi-file batch import,
+  // so both detect headers the same way.
+  function parseCsvRaw(file: File): Promise<{ name: string; headers: string[]; rows: Record<string, string>[] } | null> {
+    return new Promise((resolve) => {
+      Papa.parse<string[]>(file, {
+        header: false,
+        skipEmptyLines: true,
+        delimiter: "",   // auto-detect delimiter
+        encoding: "UTF-8",
+        complete: (result) => {
+          const rawRows = result.data as string[][];
+          if (rawRows.length === 0) {
+            toast({ title: "Empty file", description: `"${file.name}" has no rows.`, variant: "destructive" });
+            resolve(null);
+            return;
+          }
+
+          // Find the row with the most non-empty cells in the first 15 rows.
+          // That row is almost always the real header row.
+          let headerRowIdx = 0;
+          let maxCols = 0;
+          for (let i = 0; i < Math.min(rawRows.length, 15); i++) {
+            const nonEmpty = rawRows[i].filter((c) => c.trim() !== "").length;
+            if (nonEmpty > maxCols) {
+              maxCols = nonEmpty;
+              headerRowIdx = i;
+            }
+          }
+
+          // Clean and filter header cells
+          const headers = rawRows[headerRowIdx]
+            .map((h) => cleanHeader(h))
+            .filter((h) => h !== "");
+
+          if (headers.length === 0) {
+            toast({
+              title: "No columns found",
+              description: `Could not detect column headers in "${file.name}".`,
+              variant: "destructive",
+            });
+            resolve(null);
+            return;
+          }
+
+          // Build data rows from everything after the header row
+          const rows = rawRows.slice(headerRowIdx + 1).map((row) => {
+            const obj: Record<string, string> = {};
+            headers.forEach((h, i) => { obj[h] = row[i] ?? ""; });
+            return obj;
+          });
+
+          resolve({ name: file.name, headers, rows });
+        },
+        error: (err) => {
+          toast({ title: "Could not parse CSV", description: `"${file.name}": ${err.message}`, variant: "destructive" });
+          resolve(null);
+        },
+      });
+    });
+  }
+
+  function buildItemsFromRows(rows: Record<string, string>[], activeMapping: Mapping) {
+    return rows.map((row) => {
+      const get = (key: TargetKey) => {
+        const col = activeMapping[key];
+        return col && col !== SKIP ? (row[col] ?? "") : "";
+      };
+      return {
+        // Trimmed — an Excel-exported CSV can pad a barcode cell to a fixed width with
+        // whitespace, and this value becomes the literal key product_plant_stock upserts
+        // against later; an untrimmed one silently splits stock into a second, orphaned row.
+        barcode:         get("barcode").trim() || null,
+        itemName:        get("itemName") || null,
+        sapCode:         get("sapCode") || null,
+        quantity:        parseInt(get("quantity")) || 0,
+        expectedPallets: parseFloat(get("expectedPallets")) || null,
+        date:            orderDate || null,
+      };
+    });
+  }
+
+  async function parseAndOpen(file: File) {
+    const parsed = await parseCsvRaw(file);
+    if (!parsed) return;
+    setCsvData(parsed);
+    setMapping(autoMatch(parsed.headers));
+    setShowMappingDialog(true);
+  }
+
+  function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(e.target.files ?? []);
+    if (files.length === 0) return;
+    setSelectedFiles(files);
+    setLastImport(null);
+    e.target.value = "";
+
+    // Reupload flow: plant/orderDate were already filled in when the file picker was popped
+    // open, so skip the separate "Map & Import" click and go straight to the mapping dialog.
+    if (reuploadPendingRef.current) {
+      reuploadPendingRef.current = false;
+      uploadQueueRef.current = files;
+      uploadIdxRef.current = 0;
+      uploadCollectedRef.current = { sessionIds: [], fileNames: [], failed: [], totalRows: 0, groupId: null };
+      setUploadProgress({ current: 1, total: files.length });
+      parseAndOpen(files[0]);
+    }
+  }
+
+  // Start the sequential Map & Import queue: opens the mapping dialog for the first file;
+  // each confirm imports that file and advances to the next file's mapping dialog.
+  function handleImportClick() {
+    if (!plant.trim()) {
+      toast({ title: "Select a plant first", variant: "destructive" });
+      return;
+    }
+    // Order Date drives FIFO grouping (plant + orderDate) and now Master View's scoping too,
+    // so an import without one can't be placed in a group at all — require it up front.
+    if (!orderDate.trim()) {
+      toast({ title: "Select an Order Date first", description: "The Order Date decides which CSVs merge together as parts of one order.", variant: "destructive" });
+      return;
+    }
+    if (selectedFiles.length === 0) {
+      toast({ title: "Select a CSV file first", variant: "destructive" });
+      return;
+    }
+    if (isPastDateBlocked) {
+      toast({
+        title: "This Order Date is in the past",
+        description: `No existing order for ${plant} on ${orderDate} — a brand-new order can't use a past date. Pick today or later, or the correct existing date for a late part.`,
+        variant: "destructive",
+      });
+      return;
+    }
+    uploadQueueRef.current = selectedFiles;
+    uploadIdxRef.current = 0;
+    uploadCollectedRef.current = { sessionIds: [], fileNames: [], failed: [], totalRows: 0, groupId: null };
+    setUploadProgress({ current: 1, total: selectedFiles.length });
+    parseAndOpen(selectedFiles[0]);
+  }
+
+  function handleConfirmImport() {
+    if (!csvData) return;
+    const items = buildItemsFromRows(csvData.rows, mapping);
+    importQueuedFile(csvData.name, items);
+  }
+
+  // Imports the current queued file (with the shared plant + Order Date, so the server
+  // auto-groups it), then either opens the next file's mapping dialog or finishes the batch.
+  async function importQueuedFile(csvFileName: string, items: object[]) {
+    setIsBatchImporting(true);
+    const c = uploadCollectedRef.current;
+    try {
+      const resp = await apiRequest("POST", "/api/order-import/sessions", { plant, csvFileName, items, orderDate });
+      const data = await resp.json();
+      if (data?.session?.id) {
+        if (c.groupId == null) c.groupId = data.session.receivingSessionId ?? data.session.id;
+        c.sessionIds.push(data.session.id);
+        c.fileNames.push(csvFileName);
+        c.totalRows += data.rowCount ?? 0;
+      } else {
+        c.failed.push(csvFileName);
+      }
+    } catch {
+      c.failed.push(csvFileName);
+    }
+
+    const nextIdx = uploadIdxRef.current + 1;
+    const queue = uploadQueueRef.current;
+    if (nextIdx < queue.length) {
+      uploadIdxRef.current = nextIdx;
+      setUploadProgress({ current: nextIdx + 1, total: queue.length });
+      setIsBatchImporting(false);
+      await parseAndOpen(queue[nextIdx]); // reopen mapping dialog for the next file
+    } else {
+      finishQueuedImport();
+    }
+  }
+
+  function finishQueuedImport() {
+    const c = uploadCollectedRef.current;
+    setIsBatchImporting(false);
+    setShowMappingDialog(false);
+    setCsvData(null);
+    setSelectedFiles([]);
+    if (fileRef.current) fileRef.current.value = "";
+    setUploadProgress(null);
+    setLastImport({ rowCount: c.totalRows });
+    setShowHistory(true);
+    setCurrentPage(1);
+    setFilterDate("");
+    setFilterPlant("");
+    refetchAllSessionQueries();
+
+    const n = c.sessionIds.length;
+    toast({
+      title: c.failed.length === 0 ? "Import complete" : n === 0 ? "Import failed" : "Import finished with errors",
+      description: `${n} file(s) imported · ${c.totalRows} rows${c.failed.length ? ` · failed: ${c.failed.join(", ")}` : ""}. Same plant + order date auto-group; Part 1 loads now, the rest auto-load as each completes. View reports on the Order Reports page.`,
+      variant: n === 0 ? "destructive" : undefined,
+      className: c.failed.length === 0 ? "bg-green-50 border-green-200 text-green-900" : undefined,
+    });
+  }
+
+  function clearForm() {
+    setSelectedFiles([]);
+    setLastImport(null);
+    setOrderDate(getLocalISODate());
+    if (fileRef.current) fileRef.current.value = "";
+  }
+
+  const sessions        = sessionsQuery.data?.sessions  ?? [];
+  const totalSessions   = sessionsQuery.data?.total     ?? 0;
+  // History is server-paged and its total reflects whatever plant filter is applied, so remember
+  // the unfiltered figure and show that on the tab badge — matching the other three, which ignore
+  // the plant row too.
+  const [historyTotalAll, setHistoryTotalAll] = useState(0);
+  useEffect(() => {
+    if (!filterPlant) setHistoryTotalAll(totalSessions);
+  }, [filterPlant, totalSessions]);
+  const totalPages      = sessionsQuery.data?.totalPages ?? 1;
+  const safePage        = currentPage;
+
+  const allItems = itemsQuery.data ?? [];
+  const filteredItems = itemSearch
+    ? allItems.filter((i) =>
+        [i.barcode, i.itemName, i.sapCode].some((v) =>
+          v?.toLowerCase().includes(itemSearch.toLowerCase())
+        )
+      )
+    : allItems;
+
+  const plantOptions = (plantsQuery.data ?? []).filter((p) => p.name && p.name.trim() !== "");
+  // Plant colors from Plant Management, keyed by upper-cased name, for the plant tab pills.
+  const plantColorByName = new Map(plantOptions.map((p) => [p.name.toUpperCase(), p]));
+
+  // ── Unloading mode: plant list restricted the same way Unloading's own import dialog was,
+  // and CSV History (moved here from client/src/pages/Unloading/Unloading.tsx — its own CSV
+  // History tab is gone; this is the only place to browse unload CSV uploads now). ─────────────
+  const unloadUserPlants = getUserPlantsClient();
+  const unloadImportablePlants = plantOptions.filter(
+    (p) => unloadUserPlants === null || unloadUserPlants.includes(p.name.toLowerCase()),
+  );
+  type UnloadCsvHistoryUpload = {
+    csvFileName: string; plant: string; orderDate: string; importedByCode: string | null;
+    importedByName: string | null; uploadedAt: string; vehicleCount: number; totalRows: number;
+    // The ordered QUANTITY across this upload's rows — totalRows is only how many lines the file
+    // has, which says nothing about how big the delivery is.
+    totalQty: number;
+    vehicleNumbers: string[]; sessionIds: number[]; vehicles: { vehicleNumber: string; sessionId: number }[];
+  };
+  const [unloadHistoryOffset, setUnloadHistoryOffset] = useState(0);
+  const [unloadHistoryPlantFilter, setUnloadHistoryPlantFilter] = usePersistentFilter("orderImport:unloadHistoryPlant", "");
+  const [unloadHistoryDateFilter, setUnloadHistoryDateFilter] = usePersistentFilter("orderImport:unloadHistoryDate", "");
+  const UNLOAD_HISTORY_LIMIT = 20;
+  const unloadCsvHistoryQuery = useQuery<{
+    uploads: UnloadCsvHistoryUpload[]; total: number;
+    // Across every upload the filters match, not just the page shown.
+    grandTotals?: { rows: number; qty: number; vehicles: number };
+  }>({
+    queryKey: ["/api/unloading/csv-history", unloadHistoryOffset, unloadHistoryPlantFilter, unloadHistoryDateFilter],
+    queryFn: () => apiRequest(
+      "GET",
+      `/api/unloading/csv-history?limit=${UNLOAD_HISTORY_LIMIT}&offset=${unloadHistoryOffset}${unloadHistoryPlantFilter ? `&plant=${encodeURIComponent(unloadHistoryPlantFilter)}` : ""}${unloadHistoryDateFilter ? `&orderDate=${encodeURIComponent(unloadHistoryDateFilter)}` : ""}`,
+    ).then((r) => r.json()),
+    enabled: pageMode === "unloading",
+  });
+  const unloadCsvUploads = unloadCsvHistoryQuery.data?.uploads ?? [];
+  const unloadCsvHistoryTotal = unloadCsvHistoryQuery.data?.total ?? 0;
+  const unloadCsvGrandTotals = unloadCsvHistoryQuery.data?.grandTotals ?? { rows: 0, qty: 0, vehicles: 0 };
+  const [expandedUnloadCsvUpload, setExpandedUnloadCsvUpload] = useState<string | null>(null);
+
+  // ── Delete a CSV upload — mirrors Order Import's own per-session delete dialog (replace vs
+  // discard, same two options either way), just aggregated across every vehicle session this one
+  // upload created (see UnloadCsvHistoryUpload.sessionIds) since one CSV can span several
+  // vehicles. The preview is summed across all of them so the dialog's copy reflects whether ANY
+  // of them already has scan activity, not just the first. ──────────────────────────────────────
+  // Edit a vehicle's items — same EditCsvDialog Order Import's own Edit uses (basePath="unloading"),
+  // opened from a vehicle chip in the expanded CSV History row (see u.vehicles above). Session id
+  // only, since EditCsvDialog resolves everything else (plant, csvFileName, items) itself.
+  const [unloadEditSessionId, setUnloadEditSessionId] = useState<number | null>(null);
+
+  const [unloadDeleteTarget, setUnloadDeleteTarget] = useState<UnloadCsvHistoryUpload | null>(null);
+  const [unloadDeletePreview, setUnloadDeletePreview] = useState<{
+    scannedBarcodeCount: number; scannedQtyTotal: number; extraQtyTotal: number; stockApplied: boolean;
+  } | null>(null);
+  const [isLoadingUnloadDeletePreview, setIsLoadingUnloadDeletePreview] = useState(false);
+
+  async function openUnloadDeleteConfirm(u: UnloadCsvHistoryUpload) {
+    setUnloadDeleteTarget(u);
+    setUnloadDeletePreview(null);
+    setIsLoadingUnloadDeletePreview(true);
+    try {
+      const previews: Array<{ scannedBarcodeCount: number; scannedQtyTotal: number; extraQtyTotal: number; stockApplied: boolean }> =
+        await Promise.all(u.sessionIds.map((id) => apiRequest("GET", `/api/unloading/sessions/${id}/delete-preview`).then((r) => r.json())));
+      setUnloadDeletePreview(previews.reduce((acc, p) => ({
+        scannedBarcodeCount: acc.scannedBarcodeCount + (p.scannedBarcodeCount ?? 0),
+        scannedQtyTotal: acc.scannedQtyTotal + (p.scannedQtyTotal ?? 0),
+        extraQtyTotal: acc.extraQtyTotal + (p.extraQtyTotal ?? 0),
+        stockApplied: acc.stockApplied || !!p.stockApplied,
+      }), { scannedBarcodeCount: 0, scannedQtyTotal: 0, extraQtyTotal: 0, stockApplied: false }));
+    } catch {
+      // Leave preview null — the dialog falls back to its generic (no-preview) copy below.
+    } finally {
+      setIsLoadingUnloadDeletePreview(false);
+    }
+  }
+
+  const unloadDeleteMutation = useMutation({
+    mutationFn: async ({ sessionIds, mode }: { sessionIds: number[]; mode: "replace" | "discard" }) => {
+      await Promise.all(sessionIds.map((id) => apiRequest("DELETE", `/api/unloading/sessions/${id}?mode=${mode}`)));
+      return { mode };
+    },
+    onSuccess: ({ mode }) => {
+      qc.invalidateQueries({ queryKey: ["/api/unloading/csv-history"] });
+      const target = unloadDeleteTarget;
+      setUnloadDeleteTarget(null);
+      setUnloadDeletePreview(null);
+      if (mode === "replace" && target) {
+        setUnloadImportPlant(target.plant);
+        setUnloadImportDate(target.orderDate);
+        toast({ title: "Pick the corrected CSV", description: "Plant and Order Date are filled in — choose the file to continue." });
+        unloadFileRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+        unloadFileRef.current?.click();
+      }
+    },
+    onError: (error: any) => toast({ title: "Delete failed", description: error?.message, variant: "destructive" }),
+  });
+
+  function resetUnloadImportForm() {
+    setUnloadImportPlant(""); setUnloadImportDate(""); setUnloadImportFile(null);
+    if (unloadFileRef.current) unloadFileRef.current.value = "";
+  }
+
+  async function handleUnloadFileChosen(file: File) {
+    const parsed = await parseCsvRaw(file);
+    if (!parsed) return;
+    setUnloadCsvData(parsed);
+    setUnloadMapping(unloadAutoMatch(parsed.headers));
+    setShowUnloadMappingDialog(true);
+  }
+
+  function handleUnloadImportClick() {
+    if (!unloadImportPlant.trim()) { toast({ title: "Select a plant first", variant: "destructive" }); return; }
+    if (!unloadImportDate.trim()) { toast({ title: "Select an Order Date first", variant: "destructive" }); return; }
+    if (!unloadImportFile) { toast({ title: "Select a CSV file first", variant: "destructive" }); return; }
+    handleUnloadFileChosen(unloadImportFile);
+  }
+
+  async function handleConfirmUnloadImport() {
+    if (!unloadCsvData) return;
+    const get = (row: Record<string, string>, key: UnloadTargetKey) => {
+      const col = unloadMapping[key];
+      return col && col !== SKIP ? (row[col] ?? "") : "";
+    };
+    if (unloadMapping.vehicleNumber === SKIP) { toast({ title: "Map the Vehicle Number column", variant: "destructive" }); return; }
+    if (unloadMapping.barcode === SKIP) { toast({ title: "Map the Barcode column", variant: "destructive" }); return; }
+    if (unloadMapping.quantity === SKIP) { toast({ title: "Map the Quantity column", variant: "destructive" }); return; }
+
+    const items = unloadCsvData.rows.map((row) => ({
+      vehicleNumber: get(row, "vehicleNumber").trim(),
+      barcode: get(row, "barcode").trim(),
+      itemName: get(row, "itemName").trim() || null,
+      sapCode: get(row, "sapCode").trim() || null,
+      quantity: parseUnloadQtyCell(get(row, "quantity")),
+    })).filter((it) => it.vehicleNumber || it.barcode);
+
+    setIsUnloadImporting(true);
+    try {
+      const data = await apiRequest("POST", "/api/unloading/import", {
+        plant: unloadImportPlant, orderDate: unloadImportDate, csvFileName: unloadCsvData.name, items,
+      }, false, true);
+
+      toast({
+        title: "Imported",
+        description: `${unloadCsvData.name} — ${data.vehicles.length} vehicle(s): ${data.vehicles.map((v: any) => `${v.vehicleNumber} (${v.rowCount})${v.replacesSessionId ? " · replaced" : ""}`).join(", ")}`,
+      });
+      qc.invalidateQueries({ queryKey: ["/api/unloading/csv-history"] });
+      setShowUnloadMappingDialog(false);
+      setUnloadCsvData(null);
+      resetUnloadImportForm();
+    } catch (error: any) {
+      toast({ title: "Import failed", description: error?.message || "Could not import CSV", variant: "destructive" });
+    } finally {
+      setIsUnloadImporting(false);
+    }
+  }
+
+  const _allScanSessions = scanSessionsQuery.data ?? [];
+
+  // Recent Complete tab — one row per PLANT, whichever session completed most recently there, no
+  // matter how long ago (unlike scanSessionsQuery above, not limited to the last 48h). Always
+  // every plant the user can see, ignoring the tab's own plant filter — the point is a one-glance
+  // "what just finished, what can I reopen right now" view across plants. Every row here is by
+  // construction the single most-recently-completed session for its plant, so it's always
+  // reopen-eligible.
+  const recentCompleteQuery = useQuery<ScanSession[]>({
+    queryKey: ["/api/order-scan/sessions/recent-complete"],
+    queryFn: () => apiRequest("GET", "/api/order-scan/sessions/recent-complete").then((r) => r.json()),
+  });
+  const recentCompleteSessions = recentCompleteQuery.data ?? [];
+
+  // Plants that currently have an active session — UNFILTERED by the Active tab's own
+  // plant/date filters, since this drives whether Load is disabled on the Available tab
+  // and must always reflect true global state, not whatever the user is filtering by.
+  const activePlantsSet = new Set(
+    _allScanSessions.filter((s) => s.scanStatus === "active").map((s) => (s.plant ?? "").toLowerCase()),
+  );
+
+  // Client-side filters — empty string means "all". Status filter ensures a session
+  // removed via completeMutation disappears from Currently Active immediately (cache
+  // patch sets scanStatus → "completed" before the background refetch arrives).
+  // Date filters match the ORDER DATE (what the CSV is FOR), not createdAt (when it was
+  // uploaded) — those diverge whenever a late part is added to an earlier order, and the
+  // order date is what users think in. Same value FIFO grouping and Master View key on.
+  const availableScanSessions = _allScanSessions.filter(s =>
+    s.scanStatus === "available" &&
+    (!scanPlant    || (s.plant ?? "").toLowerCase() === scanPlant.toLowerCase()) &&
+    (!plantTab     || (s.plant ?? "").toLowerCase() === plantTab.toLowerCase()) &&
+    (!scanDate     || (s.orderDate ?? "").slice(0, 10) === scanDate)
+  );
+  const activeScanSessions = _allScanSessions.filter(s =>
+    s.scanStatus === "active" &&
+    (!activePlant  || (s.plant ?? "").toLowerCase() === activePlant.toLowerCase()) &&
+    (!plantTab     || (s.plant ?? "").toLowerCase() === plantTab.toLowerCase()) &&
+    (!activeDate   || (s.orderDate ?? "").slice(0, 10) === activeDate)
+  );
+  // Recent Complete: one row per plant (the most recently completed session there), regardless
+  // of age — sourced from recentCompleteQuery, not the 48h-windowed _allScanSessions. Always shows
+  // every plant the user can see; the tab's own plant picker is intentionally not applied here.
+  const completedScanSessions = recentCompleteSessions;
+  // Every row in completedScanSessions is already the plant's latest by construction, so Reopen is
+  // always valid for it — this map is kept only because the render block below already reads from
+  // it, and it doubles as a safety net matching the server's independently-enforced rule.
+  const lastCompletedIdByPlant = new Map<string, { id: number; completedAt: string }>();
+  for (const s of recentCompleteSessions) {
+    if (!s.scanCompletedAt) continue;
+    const key = (s.plant ?? "").toLowerCase();
+    const cur = lastCompletedIdByPlant.get(key);
+    if (!cur || s.scanCompletedAt > cur.completedAt || (s.scanCompletedAt === cur.completedAt && s.id > cur.id)) {
+      lastCompletedIdByPlant.set(key, { id: s.id, completedAt: s.scanCompletedAt });
+    }
+  }
+  // Tab badge counts deliberately ignore the plant row, so each status always advertises its full
+  // total. Without this, picking a plant on one tab silently shrinks every other tab's count and
+  // you lose sight of what's waiting elsewhere. The per-tab date filters still apply.
+  const countByStatus = (status: string, date: string) =>
+    _allScanSessions.filter((s) =>
+      s.scanStatus === status && (!date || (s.orderDate ?? "").slice(0, 10) === date),
+    ).length;
+  const availableCount = countByStatus("available", scanDate);
+  const activeCount    = countByStatus("active", activeDate);
+  // One row per plant now (see completedScanSessions above) — count is just how many plants qualify.
+  const completedCount = recentCompleteSessions.length;
+
+  const activeId = activeSessionQuery.data?.id ?? null;
+
+  const [activeTab, setActiveTab] = usePersistentFilter<"available" | "active" | "completed" | "history">("orderImport:statusTab", "available");
+
+  // Plant tabs come from the sessions in the current status tab (ignoring the plant selection
+  // itself, so picking a plant never empties the row). History pages server-side, so it falls back
+  // to every known session. A plant appears only once it actually has sessions.
+  const plantTabSource = _allScanSessions.filter((s) =>
+    activeTab === "history" ? true : s.scanStatus === activeTab,
+  );
+  const plantTabs = Array.from(
+    // Show EVERY configured plant as a tab (from Plant Management), not only ones that happen to
+    // have sessions in this status — plus any plant seen on a session or currently selected, to be
+    // safe against a session whose plant was later removed from the list.
+    new Set(
+      [
+        ...plantOptions.map((p) => p.name.trim()),
+        ...plantTabSource.map((s) => (s.plant ?? "").trim()),
+        plantTab.trim(),
+      ].filter(Boolean),
+    ),
+  ).sort((a, b) => a.localeCompare(b));
+
+  // Switching status tabs always resets the plant row back to All, so each tab opens showing
+  // everything rather than inheriting a plant picked on a previous tab.
+  const selectStatusTab = (key: "available" | "active" | "completed" | "history") => {
+    setActiveTab(key);
+    setPlantTab("");
+    setFilterPlant("");
+    setCurrentPage(1);
+  };
+
+  // Setting filterPlant too keeps the server-paged History query — and therefore the History tab's
+  // count — on the same plant as the client-side tabs, so every status count reflects the
+  // selected plant rather than only the tab you happen to be looking at.
+  const selectPlantTab = (name: string) => {
+    setPlantTab(name);
+    setFilterPlant(name);
+    setCurrentPage(1);
+  };
+
+  return (
+    <main className="flex-1 overflow-y-auto overflow-x-hidden bg-gray-50">
+      <div className="mx-auto w-full max-w-[1800px] px-4 py-6 space-y-6">
+
+        {/* ── Page Header ── */}
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-center gap-3">
+            <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-[#001d6e] text-white shadow-sm">
+              <FileUp className="h-6 w-6" />
+            </div>
+            <div>
+              <h1 className="text-2xl font-bold text-[#001d6e]">Order Management</h1>
+              <p className="text-sm text-gray-500">Upload a CSV, map columns, and manage scan sessions</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <div className="flex items-center gap-1.5" title={wsConnected ? "Real-time updates active" : "Live updates via polling (WebSocket not connected)"}>
+              <span className={`h-2 w-2 rounded-full ${wsConnected ? "bg-green-500" : "bg-amber-500 animate-pulse"}`} />
+              <span className={`text-xs font-medium ${wsConnected ? "text-green-700" : "text-amber-600"}`}>
+                {wsConnected ? "Live" : "Syncing"}
+              </span>
+            </div>
+            <button
+              className="inline-flex items-center gap-1.5 border border-gray-200 bg-white px-3 py-1.5 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+              onClick={() => sessionsQuery.refetch()}
+              disabled={sessionsQuery.isFetching}
+            >
+              <RefreshCw className={`h-4 w-4 ${sessionsQuery.isFetching ? "animate-spin" : ""}`} />
+              Refresh
+            </button>
+          </div>
+        </div>
+
+        {/* ── Page mode switcher — "Order Import" is this page's original content, unchanged.
+            "Unloading" is a second, independent CSV-import + history pane (Unloading's own
+            vehicle-wise import, moved here from the Unloading page — see its own section below);
+            the actual scan workflow still lives entirely on the Unloading page. ── */}
+        <div className="flex gap-1.5">
+          {(
+            [
+              { key: "order-import" as const, label: "Order Import" },
+              { key: "unloading" as const, label: "Unloading" },
+            ]
+          ).map((m) => (
+            <button
+              key={m.key}
+              onClick={() => setPageMode(m.key)}
+              className={
+                pageMode === m.key
+                  ? "rounded-full bg-[#001d6e] text-white px-4 py-1.5 text-sm font-medium"
+                  : "rounded-full bg-white border border-gray-200 text-gray-600 px-4 py-1.5 text-sm font-medium hover:bg-gray-50"
+              }
+            >
+              {m.label}
+            </button>
+          ))}
+        </div>
+
+        {pageMode === "order-import" && (<>
+
+        {/* ── Upload Card ── */}
+        <div className="border border-gray-200 bg-white shadow-sm">
+          <div className="flex items-center gap-2 border-b border-gray-100 px-6 py-4">
+            <Upload className="h-5 w-5 text-[#001d6e]" />
+            <h2 className="text-base font-semibold text-gray-900">Upload CSV</h2>
+          </div>
+          <div className="p-6 space-y-4">
+            {/* Desktop layout — a fixed 12-col grid instead of flex-wrap with ad-hoc min-widths,
+                so the fields always line up the same way regardless of content length. */}
+            <div className="hidden sm:grid sm:grid-cols-12 sm:items-end sm:gap-4">
+              {/* Plant */}
+              <div className="col-span-3 grid gap-1.5">
+                <Label className="text-xs font-medium text-gray-600">Plant</Label>
+                {plantOptions.length > 0 ? (
+                  <Select value={plant || "_none_"} onValueChange={(v) => setPlant(v === "_none_" ? "" : v)}>
+                    <SelectTrigger className="h-10 text-sm rounded-full"><SelectValue placeholder="Select…" /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="_none_">— Select —</SelectItem>
+                      {plantOptions.map((p) => <SelectItem key={p.name} value={p.name}>{p.name}</SelectItem>)}
+                    </SelectContent>
+                  </Select>
+                ) : (
+                  <Input className="h-10 text-sm rounded-full" value={plant} onChange={(e) => setPlant(e.target.value)} placeholder="Plant…" />
+                )}
+              </div>
+              {/* Date */}
+              <div className="col-span-2 grid gap-1.5">
+                <Label className="text-xs font-medium text-gray-600">Order Date</Label>
+                {/* min=today: a normal upload here is always a new file for today (or later).
+                    The one legitimate past-date case — replacing a deleted CSV for an order
+                    that already exists — goes through "Delete, I'll re-upload" instead, which
+                    sets orderDate via state and so isn't affected by this min. The
+                    pastDateCheckQuery/isPastDateBlocked warning below stays as a second line of
+                    defense against a manually typed-in past date slipping past the picker. */}
+                <Input type="date" min={earliestOrderDateStr} className={`h-10 text-sm w-full rounded-full ${isPastDateBlocked ? "border-red-400" : ""}`} value={orderDate} onChange={(e) => setOrderDate(e.target.value)} />
+                {isPastDateBlocked && (
+                  <p className="text-[11px] leading-snug text-red-600">No existing order for this plant/date — pick today or later.</p>
+                )}
+              </div>
+              {/* File */}
+              <div className="col-span-4 grid gap-1.5">
+                <Label className="text-xs font-medium text-gray-600 truncate">
+                  CSV File{selectedFiles.length === 1 && <span className="text-green-600 font-medium"> · {selectedFiles[0].name}</span>}
+                  {selectedFiles.length > 1 && <span className="text-green-600 font-medium"> · {selectedFiles.length} files selected</span>}
+                </Label>
+                <Input ref={fileRef} type="file" accept=".csv" multiple className="h-10 text-sm rounded-full"
+                  onChange={handleFileChange} disabled={importMutation.isPending || isBatchImporting} />
+              </div>
+              {/* Actions */}
+              <div className="col-span-3 flex gap-2">
+                <Button variant="outline" className="h-10 shrink-0 rounded-full" onClick={clearForm}
+                  disabled={selectedFiles.length === 0 || importMutation.isPending || isBatchImporting}>
+                  <X className="h-4 w-4" />
+                </Button>
+                <Button className="h-10 flex-1 bg-[#001d6e] hover:bg-[#00154b] text-white rounded-full" onClick={handleImportClick}
+                  disabled={selectedFiles.length === 0 || !plant.trim() || importMutation.isPending || isBatchImporting || !canWriteOrderImport || isPastDateBlocked}
+                  title={!canWriteOrderImport ? "You have read-only access to Order Import" : isPastDateBlocked ? "No existing order for this plant/date — pick today or later" : undefined}>
+                  {(importMutation.isPending || isBatchImporting) ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Upload className="mr-2 h-4 w-4" />}
+                  {selectedFiles.length > 1 ? `Import ${selectedFiles.length} Files` : "Map & Import"}
+                </Button>
+              </div>
+            </div>
+
+            {/* Mobile layout */}
+            <div className="sm:hidden space-y-4">
+              <div className="grid gap-1.5">
+                <Label className="text-xs font-medium text-gray-600">
+                  CSV File{selectedFiles.length === 1 && <span className="text-green-600 font-medium"> · {selectedFiles[0].name}</span>}
+                  {selectedFiles.length > 1 && <span className="text-green-600 font-medium"> · {selectedFiles.length} files selected</span>}
+                </Label>
+                <Input ref={fileRef} type="file" accept=".csv" multiple
+                  className="h-11 text-sm file:mr-3 file:py-1 file:px-3 file:border-0 file:text-xs file:font-medium file:bg-[#001d6e]/10 file:text-[#001d6e] rounded-full"
+                  onChange={handleFileChange} disabled={importMutation.isPending || isBatchImporting} />
+              </div>
+              {/* Plant + Date on one row — Date gets a fixed minimum wide enough for the native
+                  picker to render its value (it clips/hides below ~140px), Plant absorbs
+                  whatever width remains instead of splitting evenly. */}
+              <div className="grid grid-cols-[1fr_142px] gap-3">
+                <div className="grid gap-1.5">
+                  <Label className="text-xs font-medium text-gray-600">Plant</Label>
+                  {plantOptions.length > 0 ? (
+                    <Select value={plant || "_none_"} onValueChange={(v) => setPlant(v === "_none_" ? "" : v)}>
+                      <SelectTrigger className="h-11 text-sm rounded-full"><SelectValue placeholder="Select…" /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="_none_">— Select —</SelectItem>
+                        {plantOptions.map((p) => <SelectItem key={p.name} value={p.name}>{p.name}</SelectItem>)}
+                      </SelectContent>
+                    </Select>
+                  ) : (
+                    <Input className="h-11 text-sm rounded-full" value={plant} onChange={(e) => setPlant(e.target.value)} placeholder="Plant…" />
+                  )}
+                </div>
+                <div className="grid gap-1.5">
+                  <Label className="text-xs font-medium text-gray-600">Order Date</Label>
+                  <Input type="date" min={earliestOrderDateStr} className={`h-11 w-full text-sm px-2 rounded-full ${isPastDateBlocked ? "border-red-400" : ""}`} value={orderDate} onChange={(e) => setOrderDate(e.target.value)} />
+                </div>
+                {isPastDateBlocked && (
+                  <p className="col-span-2 text-[11px] leading-snug text-red-600">No existing order for this plant/date — pick today or later.</p>
+                )}
+              </div>
+              <div className="flex gap-2">
+                <Button variant="outline" className="h-11 px-3.5 shrink-0 rounded-full" onClick={clearForm}
+                  disabled={selectedFiles.length === 0 || importMutation.isPending || isBatchImporting}>
+                  <X className="h-4 w-4" />
+                </Button>
+                <Button className="h-11 flex-1 bg-[#001d6e] hover:bg-[#00154b] text-white rounded-full" onClick={handleImportClick}
+                  disabled={selectedFiles.length === 0 || !plant.trim() || importMutation.isPending || isBatchImporting || !canWriteOrderImport || isPastDateBlocked}
+                  title={!canWriteOrderImport ? "You have read-only access to Order Import" : isPastDateBlocked ? "No existing order for this plant/date — pick today or later" : undefined}>
+                  {(importMutation.isPending || isBatchImporting) ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Upload className="mr-2 h-4 w-4" />}
+                  {selectedFiles.length > 1 ? `Import ${selectedFiles.length} Files` : "Map & Import"}
+                </Button>
+              </div>
+            </div>
+
+            {/* Feedback */}
+            {lastImport && (
+              <p className="flex items-center gap-1.5 text-sm text-green-700">
+                <CheckCircle className="h-4 w-4" />
+                Imported <strong>{lastImport.rowCount}</strong> rows successfully.
+              </p>
+            )}
+            {importMutation.isError && (
+              <p className="flex items-center gap-1.5 text-sm text-red-600">
+                <AlertCircle className="h-4 w-4" />
+                {(importMutation.error as Error).message}
+              </p>
+            )}
+          </div>
+        </div>
+
+        {/* ── Session Manager Tabs ── */}
+        <div className="border border-gray-200 bg-white shadow-sm">
+          {/* Tab pills header */}
+          <div className="border-b border-gray-100 px-5 py-4">
+            <div className="flex gap-1 flex-wrap">
+              {(
+                [
+                  { key: "available", label: "Available", count: availableCount },
+                  { key: "active",    label: "Active",    count: activeCount },
+                  { key: "completed", label: "Recent Complete", count: completedCount },
+                  { key: "history",   label: "History",   count: filterPlant ? historyTotalAll : totalSessions },
+                ] as { key: "available" | "active" | "completed" | "history"; label: string; count: number }[]
+              ).map((tab) => (
+                <button
+                  key={tab.key}
+                  onClick={() => selectStatusTab(tab.key)}
+                  className={
+                    activeTab === tab.key
+                      ? "rounded-full bg-[#001d6e] text-white px-4 py-1.5 text-sm font-medium"
+                      : "rounded-full bg-white border border-gray-200 text-gray-600 px-4 py-1.5 text-sm font-medium hover:bg-gray-50"
+                  }
+                >
+                  {tab.label}
+                  {tab.count > 0 && (
+                    <span className={`ml-1.5 inline-flex h-5 min-w-[20px] items-center justify-center rounded-full px-1 text-xs font-semibold ${
+                      activeTab === tab.key ? "bg-white/20 text-white" : "bg-gray-100 text-gray-600"
+                    }`}>
+                      {tab.count}
+                    </span>
+                  )}
+                </button>
+              ))}
+            </div>
+
+            {/* Plant tabs — built from the sessions present in the tab above, so they track the
+                data rather than a hard-coded list. Shown on Available/Active/History; hidden on
+                Completed since that tab now always shows every plant's latest at once. */}
+            {activeTab !== "completed" && plantTabs.length > 0 && (
+              <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-gray-100 pt-3">
+                <span className="mr-1 text-[11px] font-semibold uppercase tracking-wide text-gray-400">
+                  Plant
+                </span>
+                <button
+                  onClick={() => selectPlantTab("")}
+                  className={
+                    plantTab === ""
+                      ? "rounded-full bg-[#001d6e] px-3.5 py-1.5 text-xs font-semibold text-white ring-2 ring-[#001d6e]/30"
+                      : "rounded-full border border-gray-200 bg-white px-3.5 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-50"
+                  }
+                >
+                  All
+                </button>
+                {plantTabs.map((name) => {
+                  const isSel = plantTab.toLowerCase() === name.toLowerCase();
+                  const c = plantColorByName.get(name.toUpperCase());
+                  return (
+                    <button
+                      key={name}
+                      onClick={() => selectPlantTab(name)}
+                      // Each pill keeps its Plant Management colour whether selected or not; the
+                      // selected one gets a navy ring (same treatment as Overall Stock / Proforma
+                      // Slips) instead of turning solid navy and losing its colour.
+                      style={c?.bgColor ? { backgroundColor: c.bgColor, color: c.textColor, borderColor: c.borderColor } : undefined}
+                      className={`rounded-full px-3.5 py-1.5 text-xs font-semibold ${
+                        c?.bgColor ? "border" : "border border-gray-200 bg-white text-gray-600 hover:bg-gray-50"
+                      } ${isSel ? "ring-2 ring-[#001d6e] ring-offset-1" : ""}`}
+                    >
+                      {name}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* ── Tab: Available ── */}
+          {activeTab === "available" && (
+            <div>
+              {/* Filters */}
+              <div className="flex flex-wrap items-center gap-2 px-5 py-3 border-b border-gray-50">
+                <Input type="date" value={scanDate} onChange={(e) => { setScanDate(e.target.value); setScanExpandedId(null); }}
+                  className="h-8 w-[140px] text-xs rounded-full" />
+                {scanDate !== todayStr && (
+                  <Button size="sm" variant="ghost" className="h-8 px-2 text-xs text-gray-500 hover:text-[#001d6e] rounded-full"
+                    onClick={() => { setScanDate(todayStr); setScanExpandedId(null); }}>
+                    Today
+                  </Button>
+                )}
+                {scanDate && (
+                  <Button size="sm" variant="ghost" className="h-8 w-8 p-0 text-gray-400 hover:text-red-500 rounded-full"
+                    onClick={() => { setScanDate(""); setScanExpandedId(null); }}>
+                    <X className="h-3.5 w-3.5" />
+                  </Button>
+                )}
+                <Button size="sm" variant="outline" className="h-8 w-8 p-0 ml-auto rounded-full"
+                  onClick={() => scanSessionsQuery.refetch()} disabled={scanSessionsQuery.isFetching}>
+                  <RefreshCw className={`h-3.5 w-3.5 ${scanSessionsQuery.isFetching ? "animate-spin" : ""}`} />
+                </Button>
+              </div>
+              {/* Content */}
+              {scanSessionsQuery.isFetching && availableScanSessions.length === 0 ? (
+                <SectionSkeleton lines={5} />
+              ) : availableScanSessions.length === 0 ? (
+                <div className="flex flex-col items-center justify-center py-12 text-gray-400">
+                  <ScanLine className="h-10 w-10 mb-3 opacity-20" />
+                  <p className="text-sm font-medium">No available sessions</p>
+                  <p className="text-xs mt-1">Upload a CSV above to create one</p>
+                </div>
+              ) : (
+                <div className="divide-y">
+                  {availableScanSessions.map((s) => {
+                    const isExpanded = scanExpandedId === s.id;
+                    const scanAllItems = isExpanded ? (scanItemsQuery.data ?? []) : [];
+                    const scanFiltered = scanItemSearch
+                      ? scanAllItems.filter((i) => [i.barcode, i.itemName, i.sapCode].some((v) => v?.toLowerCase().includes(scanItemSearch.toLowerCase())))
+                      : scanAllItems;
+                    // Only one session may be active per plant at a time. Disabling Load up
+                    // front (rather than only reacting to the server's 409) is the primary
+                    // guard; the backend re-checks under a row lock on every /activate call
+                    // regardless, so a race between two admins clicking at the same instant
+                    // is still caught server-side even if both buttons briefly looked enabled.
+                    const plantBusy = activePlantsSet.has((s.plant ?? "").toLowerCase());
+                    return (
+                      <div key={s.id}>
+                        <div
+                          className="cursor-pointer px-5 py-3 hover:bg-gray-50 active:bg-gray-100"
+                          onClick={() => { setScanExpandedId(isExpanded ? null : s.id); setScanItemSearch(""); }}
+                        >
+                          {/* Stacks on a phone. Side by side, the action cluster on the right is
+                              shrink-0 and eats ~220px of a ~340px screen, leaving so little for the
+                              text that names wrapped one character per line. */}
+                          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-3">
+                            <div className="flex min-w-0 flex-1 items-center gap-3">
+                            <span className="shrink-0 text-gray-400">
+                              {isExpanded ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
+                            </span>
+                            <div className="flex-1 min-w-0">
+                              <p className="truncate text-sm font-medium text-gray-900">{stripCsvExt(s.csvFileName)}</p>
+                              <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-0.5">
+                                <PlantBadge plant={s.plant} />
+                                {/* The date this CSV is FOR — what grouping/filters key on. Shown
+                                    ahead of the upload timestamp since it's the meaningful one. */}
+                                {s.orderDate && (
+                                  <span className="bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700" title="Order Date — the date this CSV was uploaded for">
+                                    For {s.orderDate}
+                                  </span>
+                                )}
+                                <span className="hidden text-xs text-gray-400 sm:inline" title="Uploaded at">{fmtIST(s.createdAt)}</span>
+                                {s.importedByName && <span className="truncate text-xs text-gray-400">· {s.importedByName}</span>}
+                                {plantBusy && (
+                                  <span className="bg-amber-50 px-1.5 py-0.5 text-[10px] font-semibold text-amber-700" title="Another session is already active for this plant">
+                                    Plant busy
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                            </div>
+                            <div className="flex flex-wrap items-center gap-1.5 pl-7 sm:shrink-0 sm:pl-0">
+                              <span className="inline-flex items-center bg-[#001d6e]/10 px-2 py-0.5 text-xs font-semibold text-[#001d6e]" title={`${s.rowCount} rows`}>
+                                {s.rowCount}
+                              </span>
+                              {/* Ordered quantity next to the row count — the row count says how
+                                  many lines the CSV has, not how much was ordered. */}
+                              {s.totalQty != null && (
+                                <span
+                                  className="inline-flex items-center gap-1 bg-emerald-50 px-2 py-0.5 text-xs font-semibold text-emerald-700 tabular-nums"
+                                  title="Total ordered quantity across this CSV"
+                                >
+                                  {s.totalQty.toLocaleString()} qty
+                                </span>
+                              )}
+                              {canWriteOrderImport && (
+                                <Button size="sm"
+                                  className="h-7 px-2 text-xs bg-[#001d6e] hover:bg-[#00154b] text-white disabled:opacity-50 rounded-full"
+                                  disabled={loadForScanMutation.isPending || plantBusy}
+                                  title={plantBusy ? `Another session is already active for ${s.plant} — complete or deactivate it first` : undefined}
+                                  onClick={(e) => { e.stopPropagation(); if (!plantBusy) loadForScanMutation.mutate(s.id); }}>
+                                  {loadForScanMutation.isPending
+                                    ? <Loader2 className="h-3 w-3 animate-spin mr-1" />
+                                    : <ScanLine className="h-3 w-3 mr-1" />}
+                                  Load
+                                </Button>
+                              )}
+                              {canViewCsvEdit && (
+                                <Button size="sm" variant="ghost"
+                                  className="h-7 w-7 p-0 text-gray-400 hover:text-[#001d6e] rounded-full"
+                                  title="Edit CSV"
+                                  onClick={(e) => { e.stopPropagation(); setEditSessionId(s.id); }}>
+                                  <Pencil className="h-3.5 w-3.5" />
+                                </Button>
+                              )}
+                              {canDeleteOrderImport && (
+                                <Button size="sm" variant="ghost"
+                                  className="h-7 w-7 p-0 text-gray-400 hover:text-red-600 disabled:opacity-30 rounded-full"
+                                  disabled={deletePreviewMutation.isPending}
+                                  onClick={(e) => { e.stopPropagation(); setDeleteTargetInfo({ plant: s.plant, orderDate: s.orderDate || todayStr }); deletePreviewMutation.mutate(s.id); }}>
+                                  {deletePreviewMutation.isPending && deletePreviewMutation.variables === s.id
+                                    ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                    : <Trash2 className="h-3.5 w-3.5" />}
+                                </Button>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                        {isExpanded && (
+                          <div className="border-t bg-gray-50/60 px-5 py-3">
+                            <div className="mb-3 flex items-center gap-2">
+                              <div className="relative flex-1">
+                                <Search className="absolute left-3 top-2.5 h-3.5 w-3.5 text-gray-400" />
+                                <Input value={scanItemSearch} onChange={(e) => setScanItemSearch(e.target.value)}
+                                  placeholder="Search rows…" className="pl-8 h-9 text-sm rounded-full" />
+                              </div>
+                              {scanItemSearch && (
+                                <Button size="sm" variant="ghost" className="h-9 w-9 p-0 rounded-full"
+                                  onClick={() => setScanItemSearch("")}>
+                                  <X className="h-3.5 w-3.5" />
+                                </Button>
+                              )}
+                              <span className="text-xs text-gray-500 whitespace-nowrap">
+                                {scanFiltered.length}/{scanAllItems.length}
+                              </span>
+                            </div>
+                            {scanItemsQuery.isLoading ? (
+                              <SectionSkeleton lines={3} />
+                            ) : (
+                              <>
+                              {/* A 6-column table can't fit a phone without sideways scrolling,
+                                  so below 480px (and in portrait) the rows become stacked cards. */}
+                              <div className="min-[480px]:hidden landscape:hidden border bg-white">
+                                {scanFiltered.length === 0 ? (
+                                  <p className="py-8 text-center text-sm text-gray-400">No items</p>
+                                ) : (
+                                  <>
+                                    {scanFiltered.map((item, idx) => (
+                                      <div key={item.id} className="flex items-start gap-3 border-b border-gray-100 px-3 py-2.5 last:border-b-0">
+                                        <span className="mt-0.5 w-5 shrink-0 text-right text-xs tabular-nums text-gray-400">{idx + 1}</span>
+                                        <div className="min-w-0 flex-1">
+                                          <p className="text-sm font-semibold leading-snug text-gray-900">{item.itemName || "—"}</p>
+                                          <p className="mt-0.5 font-mono text-[11px] text-gray-400">
+                                            {item.barcode || "—"}{item.sapCode && ` · SAP: ${item.sapCode}`}
+                                          </p>
+                                        </div>
+                                        <span className="shrink-0 text-right text-sm tabular-nums">
+                                          <span className="font-bold text-gray-900">{item.quantity ?? 0}</span>
+                                          <span className="block text-[11px] text-purple-500">{item.expectedPallets ?? "—"} plt</span>
+                                        </span>
+                                      </div>
+                                    ))}
+                                    <div className="flex items-center justify-between gap-3 border-t-2 border-[#001d6e]/20 bg-[#f5f6f9] px-3 py-2.5 text-sm font-bold text-gray-900">
+                                      <span>Total</span>
+                                      <span className="text-right tabular-nums">
+                                        {scanFiltered.reduce((sum, i) => sum + (i.quantity ?? 0), 0).toLocaleString()}
+                                        <span className="block text-[11px] font-semibold text-purple-600">
+                                          {scanFiltered.reduce((sum, i) => sum + (i.expectedPallets ?? 0), 0).toFixed(2)} plt
+                                        </span>
+                                      </span>
+                                    </div>
+                                  </>
+                                )}
+                              </div>
+                              <div className="hidden overflow-x-auto border min-[480px]:block landscape:block">
+                                <table className="w-max min-w-full border-collapse text-xs">
+                                  <thead>
+                                    <tr>
+                                      {["#", "Barcode", "Item Name", "SAP Code", "Qty", "Pallets"].map((h) => (
+                                        <th key={h} className="sticky top-0 whitespace-nowrap border-b border-r bg-slate-100 px-3 py-2 text-left font-semibold text-[#001d6e]">{h}</th>
+                                      ))}
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {scanFiltered.map((item, idx) => (
+                                      <tr key={item.id} className={`border-b ${idx % 2 === 1 ? "bg-gray-50" : "bg-white"} hover:bg-blue-50/30`}>
+                                        <td className="border-r px-3 py-1.5 text-gray-400">{idx + 1}</td>
+                                        <td className="border-r px-3 py-1.5">{item.barcode || "—"}</td>
+                                        <td className="max-w-[160px] truncate border-r px-3 py-1.5" title={item.itemName ?? ""}>{item.itemName || "—"}</td>
+                                        <td className="border-r px-3 py-1.5">{item.sapCode || "—"}</td>
+                                        <td className="border-r px-3 py-1.5 text-right">{item.quantity ?? 0}</td>
+                                        <td className="px-3 py-1.5 text-right">{item.expectedPallets ?? "—"}</td>
+                                      </tr>
+                                    ))}
+                                    {/* Totals close the table. Over the rows ON SCREEN, so a search
+                                        narrows the total with the list rather than contradicting it. */}
+                                    {scanFiltered.length > 0 && (
+                                      <tr className="border-t-2 border-[#001d6e]/20 bg-[#f5f6f9] font-bold text-gray-900">
+                                        <td className="border-r px-3 py-2" colSpan={4}>Total</td>
+                                        <td className="border-r px-3 py-2 text-right tabular-nums">
+                                          {scanFiltered.reduce((sum, i) => sum + (i.quantity ?? 0), 0).toLocaleString()}
+                                        </td>
+                                        <td className="px-3 py-2 text-right tabular-nums">
+                                          {scanFiltered.reduce((sum, i) => sum + (i.expectedPallets ?? 0), 0).toFixed(2)}
+                                        </td>
+                                      </tr>
+                                    )}
+                                  </tbody>
+                                </table>
+                              </div>
+                              </>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ── Tab: Active ── */}
+          {activeTab === "active" && (
+            <div>
+              {activeScanSessions.length === 0 ? (
+                <div className="flex flex-col items-center justify-center py-12 text-gray-400">
+                  <PackageCheck className="h-10 w-10 mb-3 opacity-20" />
+                  <p className="text-sm font-medium">No active session</p>
+                  <p className="text-xs mt-1">Load a CSV session from Available to start scanning</p>
+                </div>
+              ) : (
+                <div className="divide-y divide-amber-100">
+                  {activeScanSessions.map((s) => (
+                    <div key={s.id} className="bg-amber-50 border border-amber-200 p-4 mx-4 my-3">
+                      <div className="flex items-center gap-3">
+                        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-amber-100 border border-amber-200">
+                          <ScanLine className="h-5 w-5 text-amber-600" />
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <p className="truncate text-sm font-bold text-gray-900">{stripCsvExt(s.csvFileName)}</p>
+                          <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-0.5">
+                            <PlantBadge plant={s.plant} />
+                            {s.orderDate && (
+                              <span className="bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700" title="Order Date — the date this CSV was uploaded for">
+                                For {s.orderDate}
+                              </span>
+                            )}
+                            <span className="text-xs text-gray-500">{s.rowCount} rows</span>
+                            {s.importedByName && <span className="text-xs text-gray-500">· {s.importedByName}</span>}
+                          </div>
+                          {s.scanActivatedByName && (
+                            <p className="mt-1 text-xs text-amber-700 font-medium truncate">
+                              Scanning by: {s.scanActivatedByName}
+                              {s.scanActivatedAt && <span className="font-normal text-gray-400"> · since {fmtIST(s.scanActivatedAt)}</span>}
+                            </p>
+                          )}
+                        </div>
+                        {/* One primary action + a kebab menu for the rest — same on mobile and
+                            desktop, avoids the old 4-button pileup that wrapped unevenly. */}
+                        <div className="flex shrink-0 items-center gap-1.5">
+                          <Button size="sm" className="h-8 px-2.5 text-xs bg-amber-600 hover:bg-amber-700 text-white rounded-full"
+                            onClick={() => navigate("/scan")}>
+                            <ScanLine className="sm:mr-1.5 h-3.5 w-3.5" /> <span className="hidden sm:inline">View Scan</span>
+                          </Button>
+                          <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                              <Button size="sm" variant="outline" className="h-8 w-8 p-0 text-gray-500 border-amber-200 hover:bg-amber-100 rounded-full">
+                                <MoreVertical className="h-4 w-4" />
+                              </Button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent align="end" className="w-44 rounded-xl">
+                              {canViewCsvEdit && (
+                                <DropdownMenuItem onClick={() => setEditSessionId(s.id)}>
+                                  <Pencil className="mr-2 h-3.5 w-3.5 text-gray-500" /> Edit CSV
+                                </DropdownMenuItem>
+                              )}
+                              <DropdownMenuItem onClick={() => openReports({ id: s.id, csvFileName: s.csvFileName, plant: s.plant, receivingSessionId: s.receivingSessionId, partIndex: s.partIndex })}>
+                                <FileBarChart className="mr-2 h-3.5 w-3.5 text-gray-500" /> Reports
+                              </DropdownMenuItem>
+                              {canWriteOrderImport && (
+                                <DropdownMenuItem
+                                  disabled={deactivateMutation.isPending}
+                                  onClick={() => setDeactivateTarget(s.id)}
+                                  className="text-amber-700 focus:text-amber-700">
+                                  <StopCircle className="mr-2 h-3.5 w-3.5" /> Deactivate
+                                </DropdownMenuItem>
+                              )}
+                              {canCompleteOrder && (
+                                <DropdownMenuItem
+                                  disabled={completeMutation.isPending}
+                                  onClick={() => setCompleteTarget(s.id)}
+                                  className="text-green-700 focus:text-green-700">
+                                  <CheckCircle2 className="mr-2 h-3.5 w-3.5" /> Complete
+                                </DropdownMenuItem>
+                              )}
+                            </DropdownMenuContent>
+                          </DropdownMenu>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ── Tab: Completed ── */}
+          {activeTab === "completed" && (
+            <div>
+              {/* One row per plant — whichever session completed most recently there, replaced the
+                  moment a newer one finishes for that plant. Ignores the plant/date pickers on
+                  purpose: the point is a one-glance view of every plant's latest, always eligible
+                  to Reopen. Use the History tab to see everything that's ever completed. */}
+              <div className="flex flex-wrap items-center justify-between gap-2 px-5 py-3 border-b border-gray-50">
+                <p className="text-xs text-gray-400">Latest completed per plant · see History for everything</p>
+                <Button size="sm" variant="outline" className="h-8 w-8 p-0 rounded-full"
+                  onClick={() => recentCompleteQuery.refetch()} disabled={recentCompleteQuery.isFetching}>
+                  <RefreshCw className={`h-3.5 w-3.5 ${recentCompleteQuery.isFetching ? "animate-spin" : ""}`} />
+                </Button>
+              </div>
+              {/* Content */}
+              {recentCompleteQuery.isFetching && completedScanSessions.length === 0 ? (
+                <SectionSkeleton lines={5} />
+              ) : completedScanSessions.length === 0 ? (
+                <div className="flex flex-col items-center justify-center py-12 text-gray-400">
+                  <CheckCircle2 className="h-10 w-10 mb-3 opacity-20" />
+                  <p className="text-sm font-medium">No completed sessions</p>
+                  <p className="text-xs mt-1">The latest completed session for each plant appears here</p>
+                </div>
+              ) : (
+                <div className="divide-y">
+                  {completedScanSessions.map((s) => (
+                    <div key={s.id} className="px-5 py-3 hover:bg-gray-50">
+                      <div className="flex items-center gap-3">
+                        <div className="flex-1 min-w-0">
+                          <p className="truncate text-sm font-medium text-gray-900">{stripCsvExt(s.csvFileName)}</p>
+                          <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-0.5">
+                            <PlantBadge plant={s.plant} />
+                            {s.orderDate && (
+                              <span className="bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700" title="Order Date — the date this CSV was uploaded for">
+                                For {s.orderDate}
+                              </span>
+                            )}
+                            {s.scanCompletedAt && (
+                              <span className="text-xs text-green-700 font-medium">
+                                Done {fmtIST(s.scanCompletedAt)}{s.scanCompletedByName ? ` · by ${s.scanCompletedByName}` : ""}
+                              </span>
+                            )}
+                            {s.importedByName && <span className="text-xs text-gray-400">· {s.importedByName}</span>}
+                            {s.scanActivatedByName && <span className="text-xs text-gray-400">· Scanned by {s.scanActivatedByName}</span>}
+                          </div>
+                        </div>
+                        <div className="flex shrink-0 items-center gap-1.5">
+                          <span className="inline-flex items-center bg-green-100 px-2 py-0.5 text-xs font-semibold text-green-700">
+                            {s.rowCount}
+                          </span>
+                          <span className="inline-flex items-center gap-1 rounded-full bg-green-100 px-2 py-0.5 text-xs font-semibold text-green-700">
+                            <CheckCircle2 className="h-3 w-3" /> Done
+                          </span>
+                          <Button size="sm" variant="outline" className="h-7 px-2 text-xs text-gray-600 border-gray-200 hover:bg-gray-50 rounded-full"
+                            onClick={() => openReports({ id: s.id, csvFileName: s.csvFileName, plant: s.plant, receivingSessionId: s.receivingSessionId, partIndex: s.partIndex })}>
+                            <FileBarChart className="h-3.5 w-3.5 sm:mr-1" /> <span className="hidden sm:inline">Reports</span>
+                          </Button>
+                          {/* Only for the single most-recently-completed session per plant — an
+                              accidental Complete click, not a general "reopen any history" tool. */}
+                          {canWriteOrderImport && lastCompletedIdByPlant.get((s.plant ?? "").toLowerCase())?.id === s.id && (
+                            <Button size="sm" variant="outline"
+                              className="h-7 px-2 text-xs text-amber-700 border-amber-200 hover:bg-amber-50 rounded-full"
+                              disabled={reopenMutation.isPending}
+                              title="Undo an accidental Complete — continue scanning this session"
+                              onClick={() => reopenMutation.mutate(s.id)}>
+                              {reopenMutation.isPending && reopenMutation.variables === s.id
+                                ? <Loader2 className="h-3.5 w-3.5 animate-spin sm:mr-1" />
+                                : <RotateCcw className="h-3.5 w-3.5 sm:mr-1" />}
+                              <span className="hidden sm:inline">Reopen</span>
+                            </Button>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ── Tab: History ── */}
+          {activeTab === "history" && (
+            <div>
+              {/* Filters */}
+              <div className="flex flex-wrap items-center gap-2 px-5 py-3 border-b border-gray-50">
+                <Input type="date" value={filterDate} onChange={(e) => { setFilterDate(e.target.value); setCurrentPage(1); }}
+                  className="h-8 w-[140px] text-xs rounded-full" />
+                {filterDate !== todayStr && (
+                  <Button size="sm" variant="ghost" className="h-8 px-2 text-xs text-gray-500 hover:text-[#001d6e] rounded-full"
+                    onClick={() => { setFilterDate(todayStr); setCurrentPage(1); }}>
+                    Today
+                  </Button>
+                )}
+                {filterDate && (
+                  <Button size="sm" variant="ghost" className="h-8 w-8 p-0 text-gray-400 hover:text-red-500 rounded-full"
+                    onClick={() => { setFilterDate(""); setCurrentPage(1); }}>
+                    <X className="h-3.5 w-3.5" />
+                  </Button>
+                )}
+                <Select value={String(pageSize)} onValueChange={(v) => { setPageSize(Number(v)); setCurrentPage(1); }}>
+                  <SelectTrigger className="h-8 w-[65px] text-xs rounded-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="10">10</SelectItem>
+                    <SelectItem value="25">25</SelectItem>
+                    <SelectItem value="50">50</SelectItem>
+                  </SelectContent>
+                </Select>
+                {/* Always mounted (visibility toggled, not presence) so the background poll
+                    never shifts the filter row — a mount/unmount here was the flicker source. */}
+                <Loader2 className={`h-3.5 w-3.5 animate-spin text-gray-400 ${sessionsQuery.isFetching ? "visible" : "invisible"}`} />
+              </div>
+              {/* Content */}
+              {sessionsQuery.isLoading ? (
+                <SectionSkeleton lines={5} />
+              ) : sessions.length === 0 ? (
+                <div className="flex flex-col items-center justify-center py-12 text-muted-foreground">
+                  <FileUp className="h-10 w-10 mb-3 opacity-20" />
+                  <p className="text-sm font-medium">
+                    {filterDate ? `No imports found for ${filterDate}.` : "No imports yet."}
+                  </p>
+                </div>
+              ) : (
+                <>
+                  <div className="divide-y">
+                    {sessions.map((session) => {
+                      const importerName = (session as any).importedByName || session.importedByCode || "Unknown";
+                      return (
+                        <div key={session.id}>
+                          <div
+                            className="cursor-pointer px-5 py-3 hover:bg-gray-50 active:bg-gray-100"
+                            onClick={() => {
+                              setExpandedId(expandedId === session.id ? null : session.id);
+                              setItemSearch("");
+                            }}
+                          >
+                            <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:gap-2">
+                              <div className="flex min-w-0 flex-1 items-start gap-2">
+                              <span className="mt-0.5 shrink-0 text-gray-400">
+                                {expandedId === session.id
+                                  ? <ChevronDown className="h-4 w-4" />
+                                  : <ChevronRight className="h-4 w-4" />}
+                              </span>
+                              <div className="flex-1 min-w-0">
+                                <p className="truncate text-sm font-medium text-gray-900">{stripCsvExt(session.csvFileName)}</p>
+                                <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-0.5">
+                                  <span className="bg-[#001d6e]/10 px-1.5 py-0.5 text-[10px] font-semibold text-[#001d6e] uppercase">{session.plant}</span>
+                                  {/* See the note on the other list: Order Date is the meaningful
+                                      one (what grouping/filters use); createdAt is just when it landed. */}
+                                  {(session as any).orderDate && (
+                                    <span className="bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700" title="Order Date — the date this CSV was uploaded for">
+                                      For {(session as any).orderDate}
+                                    </span>
+                                  )}
+                                  <span className="hidden text-xs text-gray-400 sm:inline" title="Uploaded at">{fmtIST(session.createdAt)}</span>
+                                  <span className="inline-flex items-center gap-1 text-xs text-gray-500">
+                                    <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                      <circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7"/>
+                                    </svg>
+                                    {importerName}
+                                  </span>
+                                  {(session as any).receivingSessionId && (
+                                    <span className="bg-purple-50 px-1.5 py-0.5 text-[10px] font-semibold text-purple-700">
+                                      Part {(session as any).partIndex ?? "?"}
+                                    </span>
+                                  )}
+                                  {/* When this part's scanning actually started/finished
+                                      (order_import_sessions.scanActivatedAt/scanCompletedAt) —
+                                      plus how long it was active, computed from the two. */}
+                                  {(session as any).scanActivatedAt && (
+                                    <span className="text-xs text-gray-400">Started: {fmtIST((session as any).scanActivatedAt)}</span>
+                                  )}
+                                  {(session as any).scanCompletedAt && (
+                                    <span className="text-xs text-gray-400">
+                                      Completed: {fmtIST((session as any).scanCompletedAt)}
+                                      {(session as any).scanCompletedByName ? ` · by ${(session as any).scanCompletedByName}` : ""}
+                                    </span>
+                                  )}
+                                  {formatDuration((session as any).scanActivatedAt, (session as any).scanCompletedAt) && (
+                                    <span className="bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700">
+                                      Completed In {formatDuration((session as any).scanActivatedAt, (session as any).scanCompletedAt)}
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+                              </div>
+                              <div className="flex flex-wrap items-center gap-1 pl-6 sm:ml-1 sm:shrink-0 sm:pl-0">
+                                <Badge className="bg-[#001d6e]/10 text-[#001d6e] hover:bg-[#001d6e]/10 text-xs px-1.5 rounded-xl tabular-nums" title={`${session.rowCount} rows`}>
+                                  {session.rowCount} rows
+                                </Badge>
+                                {/* Ordered quantity next to the row count — the row count says how
+                                    many lines the CSV has, not how much was ordered. */}
+                                {(session as any).totalQty != null && (
+                                  <Badge
+                                    className="bg-emerald-50 text-emerald-700 hover:bg-emerald-50 text-xs px-1.5 rounded-xl tabular-nums"
+                                    title="Total ordered quantity across this CSV"
+                                  >
+                                    {Number((session as any).totalQty).toLocaleString()} qty
+                                  </Badge>
+                                )}
+                                {(session as any).scanStatus === "active" && (
+                                  <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-700 whitespace-nowrap">
+                                    <span className="h-1.5 w-1.5 rounded-full bg-amber-400 animate-pulse" />
+                                    Loaded
+                                  </span>
+                                )}
+                                {(session as any).scanStatus === "completed" && (
+                                  <span className="inline-flex items-center gap-1 rounded-full bg-green-100 px-2 py-0.5 text-[10px] font-semibold text-green-700 whitespace-nowrap">
+                                    <CheckCircle2 className="h-3 w-3" /> Done
+                                  </span>
+                                )}
+                                {(session as any).scanStatus === "available" && (
+                                  <span className="rounded-full bg-gray-100 px-2 py-0.5 text-[10px] font-medium text-gray-500 whitespace-nowrap">
+                                    Ready
+                                  </span>
+                                )}
+                                {((session as any).scanStatus === "completed" || (session as any).scanStatus === "active") && (
+                                  <Button size="sm" variant="outline" className="h-7 px-2 text-xs text-gray-600 border-gray-200 hover:bg-gray-50 rounded-full"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      openReports({
+                                        id: session.id, csvFileName: session.csvFileName, plant: session.plant,
+                                        receivingSessionId: (session as any).receivingSessionId, partIndex: (session as any).partIndex,
+                                      });
+                                    }}>
+                                    <FileBarChart className="h-3.5 w-3.5 sm:mr-1" /> <span className="hidden sm:inline">Reports</span>
+                                  </Button>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                          {expandedId === session.id && (
+                            <div className="border-t bg-gray-50/60 px-5 py-3">
+                              <div className="mb-3 flex items-center gap-2">
+                                <div className="relative flex-1">
+                                  <Search className="absolute left-3 top-2.5 h-3.5 w-3.5 text-gray-400" />
+                                  <Input value={itemSearch} onChange={(e) => setItemSearch(e.target.value)}
+                                    placeholder="Search rows…" className="pl-8 h-9 text-sm rounded-full" />
+                                </div>
+                                {itemSearch && (
+                                  <Button size="sm" variant="ghost" className="h-9 w-9 p-0 rounded-full"
+                                    onClick={() => setItemSearch("")}>
+                                    <X className="h-3.5 w-3.5" />
+                                  </Button>
+                                )}
+                                <span className="text-xs text-gray-500 whitespace-nowrap">
+                                  {filteredItems.length}/{allItems.length}
+                                </span>
+                              </div>
+                              {itemsQuery.isLoading ? (
+                                <SectionSkeleton lines={3} />
+                              ) : (
+                                <>
+                                {/* Same reason as the Available tab: 7 columns won't fit a phone. */}
+                                <div className="min-[480px]:hidden landscape:hidden border bg-white">
+                                  {filteredItems.length === 0 ? (
+                                    <p className="py-8 text-center text-sm text-gray-400">No items</p>
+                                  ) : (
+                                    <>
+                                      {filteredItems.map((item, idx) => (
+                                        <div key={item.id} className="flex items-start gap-3 border-b border-gray-100 px-3 py-2.5 last:border-b-0">
+                                          <span className="mt-0.5 w-5 shrink-0 text-right text-xs tabular-nums text-gray-400">{idx + 1}</span>
+                                          <div className="min-w-0 flex-1">
+                                            <p className="text-sm font-semibold leading-snug text-gray-900">{item.itemName || "—"}</p>
+                                            <p className="mt-0.5 font-mono text-[11px] text-gray-400">
+                                              {item.barcode || "—"}{item.sapCode && ` · SAP: ${item.sapCode}`}
+                                            </p>
+                                            {(item as any).date && (
+                                              <p className="mt-0.5 text-[11px] text-gray-400">{(item as any).date}</p>
+                                            )}
+                                          </div>
+                                          <span className="shrink-0 text-right text-sm tabular-nums">
+                                            <span className="font-bold text-gray-900">{item.quantity ?? 0}</span>
+                                            <span className="block text-[11px] text-purple-500">{item.expectedPallets ?? "—"} plt</span>
+                                          </span>
+                                        </div>
+                                      ))}
+                                      <div className="flex items-center justify-between gap-3 border-t-2 border-[#001d6e]/20 bg-[#f5f6f9] px-3 py-2.5 text-sm font-bold text-gray-900">
+                                        <span>Total</span>
+                                        <span className="text-right tabular-nums">
+                                          {filteredItems.reduce((sum, i) => sum + (i.quantity ?? 0), 0).toLocaleString()}
+                                          <span className="block text-[11px] font-semibold text-purple-600">
+                                            {filteredItems.reduce((sum, i) => sum + (i.expectedPallets ?? 0), 0).toFixed(2)} plt
+                                          </span>
+                                        </span>
+                                      </div>
+                                    </>
+                                  )}
+                                </div>
+                                <div className="hidden overflow-x-auto border min-[480px]:block landscape:block">
+                                  <table className="w-max min-w-full border-collapse text-xs">
+                                    <thead>
+                                      <tr>
+                                        {["#", "Barcode", "Item Name", "SAP Code", "Qty", "Pallets", "Date"].map((h) => (
+                                          <th key={h} className="sticky top-0 whitespace-nowrap border-b border-r bg-slate-100 px-3 py-2 text-left font-semibold text-[#001d6e]">
+                                            {h}
+                                          </th>
+                                        ))}
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {filteredItems.map((item, idx) => (
+                                        <tr key={item.id} className={`border-b ${idx % 2 === 1 ? "bg-gray-50" : "bg-white"} hover:bg-blue-50/30`}>
+                                          <td className="border-r px-3 py-1.5 text-gray-400">{idx + 1}</td>
+                                          <td className="border-r px-3 py-1.5">{item.barcode || "—"}</td>
+                                          <td className="max-w-[200px] truncate border-r px-3 py-1.5" title={item.itemName ?? ""}>{item.itemName || "—"}</td>
+                                          <td className="border-r px-3 py-1.5">{item.sapCode || "—"}</td>
+                                          <td className="border-r px-3 py-1.5 text-right">{item.quantity ?? 0}</td>
+                                          <td className="border-r px-3 py-1.5 text-right">{item.expectedPallets ?? "—"}</td>
+                                          <td className="px-3 py-1.5">{(item as any).date || "—"}</td>
+                                        </tr>
+                                      ))}
+                                      {/* Totals close the table. Over the rows ON SCREEN, so a
+                                          search narrows the total with the list. */}
+                                      {filteredItems.length > 0 && (
+                                        <tr className="border-t-2 border-[#001d6e]/20 bg-[#f5f6f9] font-bold text-gray-900">
+                                          <td className="border-r px-3 py-2" colSpan={4}>Total</td>
+                                          <td className="border-r px-3 py-2 text-right tabular-nums">
+                                            {filteredItems.reduce((sum, i) => sum + (i.quantity ?? 0), 0).toLocaleString()}
+                                          </td>
+                                          <td className="border-r px-3 py-2 text-right tabular-nums">
+                                            {filteredItems.reduce((sum, i) => sum + (i.expectedPallets ?? 0), 0).toFixed(2)}
+                                          </td>
+                                          <td className="px-3 py-2" />
+                                        </tr>
+                                      )}
+                                    </tbody>
+                                  </table>
+                                </div>
+                                </>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                  {/* Pagination — same numbered-page-button style used across the app (Overall
+                      Stock, Users, Unloading, etc.) instead of a bespoke "← Prev / Next →" pager,
+                      and always shown (not gated on totalPages > 1) so it's still there to orient
+                      you even on a single-page result. */}
+                  {totalSessions > 0 && (
+                    <div className="flex flex-wrap items-center justify-between gap-2 border-t px-5 py-3">
+                      <span className="text-xs text-gray-500">
+                        Showing {(safePage - 1) * pageSize + 1} to {Math.min(safePage * pageSize, totalSessions)} of {totalSessions} entries
+                      </span>
+                      <nav className="flex flex-wrap items-center justify-center gap-1" aria-label="Pagination">
+                        <Button
+                          variant="outline" size="sm" className="h-8 w-8 p-0"
+                          onClick={() => setCurrentPage(Math.max(1, safePage - 1))}
+                          disabled={safePage <= 1}
+                          aria-label="Previous page"
+                        >
+                          <ChevronLeft className="h-4 w-4" />
+                        </Button>
+                        {buildPageList(safePage - 1, totalPages).map((pg, i) =>
+                          pg === "gap" ? (
+                            <span key={`gap-${i}`} aria-hidden className="select-none px-1 text-sm text-gray-400">…</span>
+                          ) : (
+                            <Button
+                              key={pg}
+                              variant={pg === safePage - 1 ? "default" : "outline"}
+                              size="sm"
+                              className={`h-8 min-w-8 px-2 tabular-nums ${pg === safePage - 1 ? "bg-[#001d6e] text-white hover:bg-[#00154b]" : ""}`}
+                              onClick={() => setCurrentPage(pg + 1)}
+                              aria-label={`Page ${pg + 1}`}
+                              aria-current={pg === safePage - 1 ? "page" : undefined}
+                            >
+                              {pg + 1}
+                            </Button>
+                          ),
+                        )}
+                        <Button
+                          variant="outline" size="sm" className="h-8 w-8 p-0"
+                          onClick={() => setCurrentPage(Math.min(totalPages, safePage + 1))}
+                          disabled={safePage >= totalPages}
+                          aria-label="Next page"
+                        >
+                          <ChevronRight className="h-4 w-4" />
+                        </Button>
+                      </nav>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+        </div>
+
+        </>)}
+
+        {pageMode === "unloading" && (
+          <>
+            {/* ── Upload Card — same layout/style as Order Import's own above, wired to
+                Unloading's vehicle-wise CSV import instead (one CSV can span multiple
+                vehicles; Map & Import still goes through a column-mapping step). ── */}
+            <div className="border border-gray-200 bg-white shadow-sm">
+              <div className="flex items-center gap-2 border-b border-gray-100 px-6 py-4">
+                <Upload className="h-5 w-5 text-[#001d6e]" />
+                <h2 className="text-base font-semibold text-gray-900">Upload Unloading CSV</h2>
+              </div>
+              <div className="p-6 space-y-4">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-12 sm:items-end sm:gap-4">
+                  <div className="sm:col-span-3 grid gap-1.5">
+                    <Label className="text-xs font-medium text-gray-600">Plant</Label>
+                    {unloadImportablePlants.length > 0 ? (
+                      <Select value={unloadImportPlant || "_none_"} onValueChange={(v) => setUnloadImportPlant(v === "_none_" ? "" : v)}>
+                        <SelectTrigger className="h-10 text-sm rounded-full"><SelectValue placeholder="Select…" /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="_none_">— Select —</SelectItem>
+                          {unloadImportablePlants.map((p) => <SelectItem key={p.name} value={p.name}>{p.name}</SelectItem>)}
+                        </SelectContent>
+                      </Select>
+                    ) : (
+                      <Input className="h-10 text-sm rounded-full" value={unloadImportPlant} onChange={(e) => setUnloadImportPlant(e.target.value)} placeholder="Plant…" />
+                    )}
+                  </div>
+                  <div className="sm:col-span-2 grid gap-1.5">
+                    <Label className="text-xs font-medium text-gray-600">Order Date</Label>
+                    <Input type="date" className="h-10 text-sm w-full rounded-full" value={unloadImportDate} onChange={(e) => setUnloadImportDate(e.target.value)} />
+                  </div>
+                  <div className="sm:col-span-4 grid gap-1.5">
+                    <Label className="text-xs font-medium text-gray-600 truncate">
+                      CSV File{unloadImportFile && <span className="text-green-600 font-medium"> · {unloadImportFile.name}</span>}
+                    </Label>
+                    <Input ref={unloadFileRef} type="file" accept=".csv" className="h-10 text-sm rounded-full"
+                      onChange={(e) => setUnloadImportFile(e.target.files?.[0] ?? null)} disabled={isUnloadImporting} />
+                  </div>
+                  <div className="sm:col-span-3 flex gap-2">
+                    <Button variant="outline" className="h-10 shrink-0 rounded-full" onClick={resetUnloadImportForm} disabled={!unloadImportFile && !unloadImportPlant && !unloadImportDate}>
+                      <X className="h-4 w-4" />
+                    </Button>
+                    <Button className="h-10 flex-1 bg-[#001d6e] hover:bg-[#00154b] text-white rounded-full" onClick={handleUnloadImportClick}
+                      disabled={!unloadImportFile || !unloadImportPlant.trim() || !unloadImportDate.trim() || isUnloadImporting}>
+                      {isUnloadImporting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Upload className="mr-2 h-4 w-4" />}
+                      Map & Import
+                    </Button>
+                  </div>
+                </div>
+                <p className="text-xs text-gray-400">One CSV can contain multiple vehicles — every row must have a Vehicle Number column.</p>
+              </div>
+            </div>
+
+            {/* ── CSV History — moved here from the Unloading page's own "CSV History" tab. ── */}
+            <div className="border border-gray-200 bg-white shadow-sm">
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-gray-100 px-6 py-4">
+                <div className="flex items-center gap-2">
+                  <History className="h-5 w-5 text-[#001d6e]" />
+                  <h2 className="text-base font-semibold text-gray-900">CSV History</h2>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Input
+                    type="date"
+                    value={unloadHistoryDateFilter}
+                    onChange={(e) => { setUnloadHistoryDateFilter(e.target.value); setUnloadHistoryOffset(0); }}
+                    className="h-9 w-auto text-sm"
+                  />
+                  {unloadHistoryDateFilter && (
+                    <Button
+                      size="sm" variant="ghost" className="h-9 w-9 p-0 text-gray-400 hover:text-red-500"
+                      onClick={() => { setUnloadHistoryDateFilter(""); setUnloadHistoryOffset(0); }}
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </Button>
+                  )}
+                  {unloadImportablePlants.length > 1 && (
+                    <Select value={unloadHistoryPlantFilter || "all"} onValueChange={(v) => { setUnloadHistoryPlantFilter(v === "all" ? "" : v); setUnloadHistoryOffset(0); }}>
+                      <SelectTrigger className="h-9 w-[160px]"><SelectValue placeholder="All Plants" /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="all">All Plants</SelectItem>
+                        {unloadImportablePlants.map((p) => <SelectItem key={p.name} value={p.name}>{p.name}</SelectItem>)}
+                      </SelectContent>
+                    </Select>
+                  )}
+                </div>
+              </div>
+              {unloadCsvHistoryQuery.isLoading ? (
+                <SectionSkeleton lines={6} />
+              ) : unloadCsvUploads.length === 0 ? (
+                <div className="flex flex-col items-center justify-center py-16 text-center">
+                  <div className="mb-3 flex h-14 w-14 items-center justify-center rounded-full bg-[#001d6e]/10">
+                    <Upload className="h-7 w-7 text-[#001d6e]/40" />
+                  </div>
+                  <div className="mb-1 text-sm font-semibold text-[#001d6e]">No CSVs imported yet</div>
+                  <p className="mb-4 max-w-xs text-xs text-muted-foreground">Import a CSV above to get started.</p>
+                </div>
+              ) : (
+                <>
+                  <div className="overflow-x-auto">
+                    <table className="w-full min-w-full caption-bottom border-collapse text-xs">
+                      <thead>
+                        <tr className="bg-[#001d6e]">
+                          <th className="w-8 border-r border-[#1a3a9c] px-2 py-2.5"></th>
+                          <th className="whitespace-nowrap border-r border-[#1a3a9c] px-3 py-2.5 text-left text-[11px] font-semibold tracking-wide uppercase text-white">CSV File</th>
+                          <th className="whitespace-nowrap border-r border-[#1a3a9c] px-3 py-2.5 text-left text-[11px] font-semibold tracking-wide uppercase text-white">Plant</th>
+                          <th className="whitespace-nowrap border-r border-[#1a3a9c] px-3 py-2.5 text-left text-[11px] font-semibold tracking-wide uppercase text-white">Order Date</th>
+                          <th className="whitespace-nowrap border-r border-[#1a3a9c] px-3 py-2.5 text-left text-[11px] font-semibold tracking-wide uppercase text-white">Vehicles</th>
+                          <th className="whitespace-nowrap border-r border-[#1a3a9c] px-3 py-2.5 text-left text-[11px] font-semibold tracking-wide uppercase text-white">Total Rows</th>
+                          <th className="whitespace-nowrap border-r border-[#1a3a9c] px-3 py-2.5 text-right text-[11px] font-semibold tracking-wide uppercase text-white">Total Qty</th>
+                          <th className="whitespace-nowrap border-r border-[#1a3a9c] px-3 py-2.5 text-left text-[11px] font-semibold tracking-wide uppercase text-white">Uploaded By</th>
+                          <th className="whitespace-nowrap border-r border-[#1a3a9c] px-3 py-2.5 text-left text-[11px] font-semibold tracking-wide uppercase text-white">Uploaded At</th>
+                          <th className="whitespace-nowrap px-3 py-2.5 text-right text-[11px] font-semibold tracking-wide uppercase text-white">Action</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {unloadCsvUploads.map((u, i) => {
+                          const rowKey = `${u.csvFileName}::${u.plant}::${u.uploadedAt}`;
+                          const isExpanded = expandedUnloadCsvUpload === rowKey;
+                          return (
+                            <>
+                              <tr
+                                key={rowKey}
+                                onClick={() => setExpandedUnloadCsvUpload((cur) => (cur === rowKey ? null : rowKey))}
+                                className={`cursor-pointer transition-colors hover:bg-[#001d6e]/[0.06] ${isExpanded ? "bg-[#001d6e]/[0.04]" : i % 2 !== 0 ? "bg-slate-50" : "bg-white"}`}
+                              >
+                                <td className="border-r border-b border-gray-200 px-2 py-2 text-center">
+                                  <ChevronDown className={`h-3.5 w-3.5 text-gray-400 transition-transform ${isExpanded ? "rotate-180 text-[#001d6e]" : ""}`} />
+                                </td>
+                                <td className="border-r border-b border-gray-200 px-3 py-2 font-semibold text-[#001d6e]" title={u.csvFileName}>{u.csvFileName}</td>
+                                <td className="border-r border-b border-gray-200 px-3 py-2"><PlantBadge plant={u.plant} /></td>
+                                <td className="border-r border-b border-gray-200 px-3 py-2 text-gray-700">{u.orderDate}</td>
+                                <td className="border-r border-b border-gray-200 px-3 py-2 text-gray-700 tabular-nums">{u.vehicleCount}</td>
+                                <td className="border-r border-b border-gray-200 px-3 py-2 text-gray-700 tabular-nums">{u.totalRows.toLocaleString()}</td>
+                                <td className="border-r border-b border-gray-200 px-3 py-2 text-right font-semibold text-[#001d6e] tabular-nums">{(u.totalQty ?? 0).toLocaleString()}</td>
+                                <td className="border-r border-b border-gray-200 px-3 py-2 text-gray-700">{u.importedByName ?? u.importedByCode ?? "—"}</td>
+                                <td className="border-r border-b border-gray-200 px-3 py-2 text-gray-700 whitespace-nowrap">{new Date(u.uploadedAt).toLocaleString()}</td>
+                                <td className="border-b border-gray-200 px-3 py-2 text-right">
+                                  <button
+                                    className="rounded p-1 text-gray-400 hover:bg-red-50 hover:text-red-600"
+                                    title="Delete this CSV"
+                                    onClick={(e) => { e.stopPropagation(); openUnloadDeleteConfirm(u); }}
+                                  >
+                                    <Trash2 className="h-3.5 w-3.5" />
+                                  </button>
+                                </td>
+                              </tr>
+                              {isExpanded && (
+                                <tr>
+                                  <td colSpan={10} className="border-b border-gray-200 bg-gray-50 px-6 py-3">
+                                    <div className="flex flex-wrap items-center gap-1.5">
+                                      <span className="text-[11px] font-semibold uppercase tracking-wide text-gray-400">Vehicles</span>
+                                      <span className="text-[11px] text-gray-400">(click one to edit its items)</span>
+                                    </div>
+                                    <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                                      {u.vehicles.map((v) => (
+                                        <button
+                                          key={v.sessionId}
+                                          type="button"
+                                          onClick={(e) => { e.stopPropagation(); setUnloadEditSessionId(v.sessionId); }}
+                                          className="flex items-center gap-1 rounded-full bg-indigo-50 px-2 py-0.5 text-[11px] font-semibold text-indigo-700 hover:bg-indigo-100"
+                                          title={`Edit ${v.vehicleNumber}'s items`}
+                                        >
+                                          {v.vehicleNumber}
+                                          <Pencil className="h-3 w-3" />
+                                        </button>
+                                      ))}
+                                    </div>
+                                  </td>
+                                </tr>
+                              )}
+                            </>
+                          );
+                        })}
+                      </tbody>
+                      {/* Two totals: this page, and every upload the filters match. With 20 rows a
+                          page, a single footer figure would quietly describe only what is on screen. */}
+                      <tfoot>
+                        <tr className="border-t-2 border-gray-300 bg-gray-50 font-semibold text-gray-700">
+                          <td className="px-2 py-2"></td>
+                          <td className="px-3 py-2" colSpan={3}>Total on this page</td>
+                          <td className="px-3 py-2 tabular-nums">
+                            {unloadCsvUploads.reduce((n, u) => n + (u.vehicleCount ?? 0), 0).toLocaleString()}
+                          </td>
+                          <td className="px-3 py-2 tabular-nums">
+                            {unloadCsvUploads.reduce((n, u) => n + (u.totalRows ?? 0), 0).toLocaleString()}
+                          </td>
+                          <td className="px-3 py-2 text-right text-[#001d6e] tabular-nums">
+                            {unloadCsvUploads.reduce((n, u) => n + (u.totalQty ?? 0), 0).toLocaleString()}
+                          </td>
+                          <td className="px-3 py-2" colSpan={3}></td>
+                        </tr>
+                        <tr className="border-t border-gray-200 bg-[#001d6e]/[0.06] font-bold text-[#001d6e]">
+                          <td className="px-2 py-2"></td>
+                          <td className="px-3 py-2" colSpan={3}>Total — all {unloadCsvHistoryTotal.toLocaleString()} upload(s)</td>
+                          <td className="px-3 py-2 tabular-nums">{unloadCsvGrandTotals.vehicles.toLocaleString()}</td>
+                          <td className="px-3 py-2 tabular-nums">{unloadCsvGrandTotals.rows.toLocaleString()}</td>
+                          <td className="px-3 py-2 text-right tabular-nums">{unloadCsvGrandTotals.qty.toLocaleString()}</td>
+                          <td className="px-3 py-2" colSpan={3}></td>
+                        </tr>
+                      </tfoot>
+                    </table>
+                  </div>
+                  {unloadCsvHistoryTotal > UNLOAD_HISTORY_LIMIT && (
+                    <div className="flex items-center justify-between gap-2 border-t border-gray-100 px-4 py-2.5">
+                      <span className="text-xs text-gray-500">
+                        Showing {unloadHistoryOffset + 1}–{Math.min(unloadHistoryOffset + UNLOAD_HISTORY_LIMIT, unloadCsvHistoryTotal)} of {unloadCsvHistoryTotal}
+                      </span>
+                      <div className="flex items-center gap-1.5">
+                        <Button size="sm" variant="outline" className="h-8 w-8 p-0" disabled={unloadHistoryOffset === 0}
+                          onClick={() => setUnloadHistoryOffset((o) => Math.max(0, o - UNLOAD_HISTORY_LIMIT))} aria-label="Previous page">
+                          <ChevronLeft className="h-4 w-4" />
+                        </Button>
+                        <Button size="sm" variant="outline" className="h-8 w-8 p-0" disabled={unloadHistoryOffset + UNLOAD_HISTORY_LIMIT >= unloadCsvHistoryTotal}
+                          onClick={() => setUnloadHistoryOffset((o) => o + UNLOAD_HISTORY_LIMIT)} aria-label="Next page">
+                          <ChevronRight className="h-4 w-4" />
+                        </Button>
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          </>
+        )}
+
+      </div>{/* end max-w-5xl */}
+
+      {/* ── Column mapping dialog ── */}
+      <Dialog
+        open={showMappingDialog}
+        onOpenChange={(open) => { if (!open) { setShowMappingDialog(false); } }}
+      >
+        <DialogContent className="max-w-2xl max-h-[90vh] flex flex-col rounded-xl">
+          <DialogHeader>
+            <DialogTitle>Map CSV Columns</DialogTitle>
+            <DialogDescription>
+              {csvData
+                ? `"${csvData.name}" — ${csvData.rows.length} rows detected. Match each target field to a CSV column.`
+                : "Map columns."}
+            </DialogDescription>
+          </DialogHeader>
+
+          {csvData && (
+            <div className="flex flex-col gap-4 overflow-y-auto flex-1 min-h-0 pr-1">
+              <div className="border border-blue-100 bg-blue-50 px-4 py-3">
+                <p className="mb-2 text-xs font-semibold text-blue-700">
+                  {csvData.headers.length} columns detected in "{csvData.name}"
+                </p>
+                <div className="flex flex-wrap gap-1.5">
+                  {csvData.headers.map((h) => (
+                    <span key={h} className="border border-blue-200 bg-white px-2 py-0.5 text-xs text-blue-800 font-mono">
+                      {h}
+                    </span>
+                  ))}
+                </div>
+              </div>
+              <div className="border bg-gray-50 p-4">
+                <p className="mb-3 text-xs font-semibold uppercase tracking-wide text-gray-500">
+                  Map each target field → CSV column
+                </p>
+                <div className="grid grid-cols-1 gap-3">
+                  {TARGET_FIELDS.map((field) => {
+                    const matched = mapping[field.key] !== SKIP && mapping[field.key] !== "";
+                    return (
+                      <div key={field.key} className="flex flex-col gap-1.5 sm:flex-row sm:items-center sm:gap-3">
+                        <div className="flex w-full items-center gap-1.5 sm:w-[140px] sm:shrink-0">
+                          <span className={`h-2 w-2 rounded-full ${matched ? "bg-green-500" : "bg-gray-300"}`} />
+                          <Label className="text-sm">{field.label}</Label>
+                        </div>
+                        <Select
+                          value={mapping[field.key] || SKIP}
+                          onValueChange={(v) => setMapping((m) => ({ ...m, [field.key]: v }))}
+                        >
+                          <SelectTrigger className={`sm:flex-1 h-9 text-sm rounded-full ${!matched ? "border-dashed text-gray-400" : ""}`}>
+                            <SelectValue placeholder="— skip this field —" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value={SKIP}>— skip this field —</SelectItem>
+                            {csvData.headers.map((h) => (
+                              <SelectItem key={h} value={h}>{h}</SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+              <div>
+                <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-gray-500">
+                  Preview — first {Math.min(5, csvData.rows.length)} of {csvData.rows.length} rows
+                </p>
+                <div className="overflow-x-auto border">
+                  <table className="w-max min-w-full border-collapse text-xs">
+                    <thead>
+                      <tr>
+                        {TARGET_FIELDS.map((f) => {
+                          const col = mapping[f.key];
+                          const matched = col && col !== SKIP;
+                          return (
+                            <th key={f.key} className={`sticky top-0 whitespace-nowrap border-b border-r px-3 py-2 text-left font-semibold ${matched ? "bg-green-50 text-green-800" : "bg-gray-100 text-gray-400"}`}>
+                              {f.label}
+                              {matched && (
+                                <div className="font-normal text-green-600 text-xs mt-0.5">← {col}</div>
+                              )}
+                            </th>
+                          );
+                        })}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {csvData.rows.slice(0, 5).map((row, i) => (
+                        <tr key={i} className="border-b hover:bg-gray-50">
+                          {TARGET_FIELDS.map((f) => {
+                            const col = mapping[f.key];
+                            const val = col && col !== SKIP ? (row[col] ?? "") : "";
+                            return (
+                              <td key={f.key} className={`max-w-[180px] truncate whitespace-nowrap border-r px-3 py-2 ${val ? "" : "text-gray-300"}`} title={val}>
+                                {val || "—"}
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <DialogFooter className="mt-2 gap-2">
+            {uploadProgress && (
+              <span className="mr-auto self-center text-xs text-gray-500">File {uploadProgress.current} of {uploadProgress.total}</span>
+            )}
+            <Button variant="outline" className="rounded-xl"
+              onClick={() => {
+                // Cancel aborts the whole queue.
+                setShowMappingDialog(false);
+                uploadQueueRef.current = [];
+                uploadIdxRef.current = 0;
+                setUploadProgress(null);
+              }}
+              disabled={isBatchImporting}>
+              Cancel
+            </Button>
+            <Button onClick={handleConfirmImport}
+              disabled={isBatchImporting || !csvData}
+              className="bg-[#001d6e] hover:bg-[#00154b] text-white rounded-xl">
+              {isBatchImporting ? (
+                <><Loader2 className="mr-1.5 h-4 w-4 animate-spin" />Importing…</>
+              ) : (
+                <><Upload className="mr-1.5 h-4 w-4" />Import {csvData?.rows.length ?? 0} rows{uploadProgress && uploadProgress.total > 1 ? ` · next file →` : ""}</>
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* ── Unloading mode's own column mapping dialog — same pattern as the one above, moved
+          here from client/src/pages/Unloading/Unloading.tsx's own import flow. ── */}
+      <Dialog open={showUnloadMappingDialog} onOpenChange={(open) => { if (!open) { setShowUnloadMappingDialog(false); setUnloadCsvData(null); } }}>
+        <DialogContent className="max-w-2xl max-h-[90vh] flex flex-col rounded-xl">
+          <DialogHeader>
+            <DialogTitle>Map CSV Columns</DialogTitle>
+            <DialogDescription>
+              {unloadCsvData ? `"${unloadCsvData.name}" — ${unloadCsvData.rows.length} rows detected. Match each target field to a CSV column.` : "Map columns."}
+            </DialogDescription>
+          </DialogHeader>
+
+          {unloadCsvData && (
+            <div className="flex flex-col gap-4 overflow-y-auto flex-1 min-h-0 pr-1">
+              <div className="border border-blue-100 bg-blue-50 px-4 py-3">
+                <p className="mb-2 text-xs font-semibold text-blue-700">{unloadCsvData.headers.length} columns detected in "{unloadCsvData.name}"</p>
+                <div className="flex flex-wrap gap-1.5">
+                  {unloadCsvData.headers.map((h) => (
+                    <span key={h} className="border border-blue-200 bg-white px-2 py-0.5 text-xs text-blue-800 font-mono">{h}</span>
+                  ))}
+                </div>
+              </div>
+              <div className="border bg-gray-50 p-4">
+                <p className="mb-3 text-xs font-semibold uppercase tracking-wide text-gray-500">Map each target field → CSV column</p>
+                <div className="grid grid-cols-1 gap-3">
+                  {UNLOAD_TARGET_FIELDS.map((field) => {
+                    const matched = unloadMapping[field.key] !== SKIP && unloadMapping[field.key] !== "";
+                    return (
+                      <div key={field.key} className="flex flex-col gap-1.5 sm:flex-row sm:items-center sm:gap-3">
+                        <div className="flex w-full items-center gap-1.5 sm:w-[160px] sm:shrink-0">
+                          <span className={`h-2 w-2 rounded-full ${matched ? "bg-green-500" : "bg-gray-300"}`} />
+                          <Label className="text-sm">{field.label}</Label>
+                        </div>
+                        <Select value={unloadMapping[field.key] || SKIP} onValueChange={(v) => setUnloadMapping((m) => ({ ...m, [field.key]: v }))}>
+                          <SelectTrigger className={`sm:flex-1 h-9 text-sm rounded-full ${!matched ? "border-dashed text-gray-400" : ""}`}>
+                            <SelectValue placeholder="— skip this field —" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value={SKIP}>— skip this field —</SelectItem>
+                            {unloadCsvData.headers.map((h) => (<SelectItem key={h} value={h}>{h}</SelectItem>))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+              <div>
+                <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-gray-500">
+                  Preview — first {Math.min(5, unloadCsvData.rows.length)} of {unloadCsvData.rows.length} rows
+                </p>
+                <div className="overflow-x-auto border">
+                  <table className="w-max min-w-full border-collapse text-xs">
+                    <thead>
+                      <tr>
+                        {UNLOAD_TARGET_FIELDS.map((f) => {
+                          const col = unloadMapping[f.key];
+                          const matched = col && col !== SKIP;
+                          return (
+                            <th key={f.key} className={`sticky top-0 whitespace-nowrap border-b border-r px-3 py-2 text-left font-semibold ${matched ? "bg-green-50 text-green-800" : "bg-gray-100 text-gray-400"}`}>
+                              {f.label}
+                              {matched && <div className="font-normal text-green-600 text-xs mt-0.5">← {col}</div>}
+                            </th>
+                          );
+                        })}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {unloadCsvData.rows.slice(0, 5).map((row, i) => (
+                        <tr key={i} className="border-b hover:bg-gray-50">
+                          {UNLOAD_TARGET_FIELDS.map((f) => {
+                            const col = unloadMapping[f.key];
+                            const val = col && col !== SKIP ? (row[col] ?? "") : "";
+                            return (
+                              <td key={f.key} className={`max-w-[180px] truncate whitespace-nowrap border-r px-3 py-2 ${val ? "" : "text-gray-300"}`} title={val}>{val || "—"}</td>
+                            );
+                          })}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <DialogFooter className="mt-2 gap-2">
+            <Button variant="outline" className="rounded-xl"
+              onClick={() => { setShowUnloadMappingDialog(false); setUnloadCsvData(null); }}
+              disabled={isUnloadImporting}>
+              Cancel
+            </Button>
+            <Button onClick={handleConfirmUnloadImport} disabled={isUnloadImporting || !unloadCsvData} className="bg-[#001d6e] hover:bg-[#00154b] text-white rounded-xl">
+              {isUnloadImporting ? (<><Loader2 className="mr-1.5 h-4 w-4 animate-spin" />Importing…</>) : (<><Upload className="mr-1.5 h-4 w-4" />Import {unloadCsvData?.rows.length ?? 0} rows</>)}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* ── Unloading mode's own delete confirmation — same "replace vs discard" two-option
+          pattern as Order Import's own delete dialog above (Delete, I'll re-upload / Remove
+          permanently), applied across every vehicle session this ONE CSV upload created. ── */}
+      <AlertDialog open={unloadDeleteTarget !== null} onOpenChange={(open) => { if (!open) { setUnloadDeleteTarget(null); setUnloadDeletePreview(null); } }}>
+        <AlertDialogContent className="rounded-xl">
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete this CSV?</AlertDialogTitle>
+            <AlertDialogDescription>
+              {isLoadingUnloadDeletePreview ? (
+                "Checking scan activity…"
+              ) : unloadDeletePreview && unloadDeletePreview.scannedBarcodeCount > 0 ? (
+                <>
+                  {unloadDeletePreview.scannedBarcodeCount} barcode(s) already scanned across {unloadDeleteTarget?.vehicleCount} vehicle(s) in this file
+                  ({unloadDeletePreview.scannedQtyTotal} total qty
+                  {unloadDeletePreview.extraQtyTotal > 0 ? `, ${unloadDeletePreview.extraQtyTotal} extra qty` : ""}
+                  {unloadDeletePreview.stockApplied ? ", stock applied" : ""}).
+                  {" "}Will you re-upload a corrected version for this plant/date?
+                  <br /><br />
+                  <b>Delete, I'll re-upload:</b> these scans are held and carried forward automatically onto the corrected CSV.
+                  <br />
+                  <b>Remove permanently:</b> these scans are reverted{unloadDeletePreview.stockApplied ? " and stock is rolled back" : ""}, and your next upload for this vehicle+date is treated as brand-new.
+                </>
+              ) : (
+                <>
+                  Will you re-upload a corrected version for this plant/date?
+                  {" "}Choose <b>Delete, I'll re-upload</b> to keep this slot for the corrected CSV, or
+                  {" "}<b>Remove permanently</b> to treat your next upload as brand-new.
+                </>
+              )}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter className="flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+            <AlertDialogCancel className="mt-0">Cancel</AlertDialogCancel>
+            <AlertDialogAction className="bg-red-600 text-white hover:bg-red-700"
+              onClick={() => unloadDeleteTarget && unloadDeleteMutation.mutate({ sessionIds: unloadDeleteTarget.sessionIds, mode: "discard" })}
+              disabled={unloadDeleteMutation.isPending || isLoadingUnloadDeletePreview}>
+              {unloadDeleteMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : "Remove permanently"}
+            </AlertDialogAction>
+            <AlertDialogAction
+              onClick={() => unloadDeleteTarget && unloadDeleteMutation.mutate({ sessionIds: unloadDeleteTarget.sessionIds, mode: "replace" })}
+              disabled={unloadDeleteMutation.isPending || isLoadingUnloadDeletePreview}>
+              {unloadDeleteMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : "Delete, I'll re-upload"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* ── Deactivate confirmation ── */}
+      <AlertDialog open={deactivateTarget !== null} onOpenChange={(open) => { if (!open) setDeactivateTarget(null); }}>
+        <AlertDialogContent className="rounded-xl">
+          <AlertDialogHeader>
+            <AlertDialogTitle>Deactivate this session?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This releases the active lock so another session can be loaded. Scan progress is preserved — you can re-activate this session later.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction className="bg-amber-600 text-white hover:bg-amber-700"
+              onClick={() => deactivateTarget !== null && deactivateMutation.mutate(deactivateTarget)}
+              disabled={deactivateMutation.isPending || !canWriteOrderImport}>
+              {deactivateMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : "Deactivate"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* ── Complete confirmation ── */}
+      <AlertDialog open={completeTarget !== null} onOpenChange={(open) => { if (!open) setCompleteTarget(null); }}>
+        <AlertDialogContent className="rounded-xl">
+          <AlertDialogHeader>
+            <AlertDialogTitle>Mark session as completed?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This marks the scan session as done. It will no longer be available for scanning.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction className="bg-green-600 text-white hover:bg-green-700"
+              onClick={() => completeTarget !== null && completeMutation.mutate(completeTarget)}
+              disabled={completeMutation.isPending || !canCompleteOrder}>
+              {completeMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : "Complete"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* ── Delete confirmation ── */}
+      <AlertDialog open={deleteTarget !== null} onOpenChange={(open) => { if (!open) { setDeleteTarget(null); setDeletePreview(null); setDeleteTargetInfo(null); } }}>
+        <AlertDialogContent className="rounded-xl">
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete this CSV?</AlertDialogTitle>
+            <AlertDialogDescription>
+              {deletePreview && deletePreview.scannedItemCount > 0 ? (
+                <>
+                  {deletePreview.scannedItemCount} item(s) already scanned against this file
+                  ({deletePreview.scannedQtyTotal} total qty
+                  {deletePreview.extraQtyTotal > 0 ? `, ${deletePreview.extraQtyTotal} extra qty` : ""}
+                  {deletePreview.stockApplied ? ", stock applied" : ""}).
+                  {" "}Will you re-upload a corrected version for this plant/date?
+                  <br /><br />
+                  <b>Yes, I'll re-upload:</b> these scans are held and carried forward automatically onto the corrected CSV.
+                  <br />
+                  <b>No, remove permanently:</b> these scans are reverted{deletePreview.stockApplied ? " and stock is rolled back" : ""}, and your next upload is treated as a brand-new file.
+                </>
+              ) : (
+                <>
+                  Will you re-upload a corrected version for this plant/date?
+                  {" "}Choose <b>re-upload later</b> to keep this slot for the corrected CSV, or
+                  {" "}<b>remove permanently</b> to treat your next upload as a brand-new file.
+                </>
+              )}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter className="flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+            <AlertDialogCancel className="mt-0">Cancel</AlertDialogCancel>
+            <AlertDialogAction className="bg-red-600 text-white hover:bg-red-700"
+              onClick={() => deleteTarget !== null && deleteMutation.mutate({ id: deleteTarget, mode: "discard" })}
+              disabled={deleteMutation.isPending}>
+              {deleteMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : "Remove permanently"}
+            </AlertDialogAction>
+            <AlertDialogAction
+              onClick={() => {
+                if (deleteTarget === null) return;
+                const info = deleteTargetInfo;
+                deleteMutation.mutate(
+                  { id: deleteTarget, mode: "replace" },
+                  {
+                    onSuccess: () => {
+                      if (info) {
+                        setPlant(info.plant);
+                        setOrderDate(info.orderDate);
+                      }
+                      toast({
+                        title: "Pick the corrected CSV",
+                        description: "Plant and Order Date are filled in — choose the file to continue.",
+                      });
+                      reuploadPendingRef.current = true;
+                      fileRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+                      fileRef.current?.click();
+                    },
+                  },
+                );
+              }}
+              disabled={deleteMutation.isPending}>
+              {deleteMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : "Delete, I'll re-upload"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <EditCsvDialog sessionId={editSessionId} onClose={() => setEditSessionId(null)} />
+      <EditCsvDialog sessionId={unloadEditSessionId} onClose={() => setUnloadEditSessionId(null)} basePath="unloading" />
+      <ReportsDialog session={reportsSession} onClose={() => setReportsSession(null)} />
+    </main>
+  );
+}

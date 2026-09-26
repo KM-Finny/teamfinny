@@ -1,0 +1,78 @@
+import React from 'react';
+import { PageSkeleton } from "@/components/ui/loading-skeletons";
+import { Route } from 'wouter';
+import { getCurrentUserPermissions } from '../lib/permissions';
+import { useAuth } from '../hooks/use-auth';
+import NotFound from '@/pages/not-found';
+import type { PageKey } from '@shared/pageKeys';
+
+interface ProtectedRouteProps {
+  path: string;
+  component: React.ComponentType<any>;
+  requireInventoryAccess?: boolean;
+  requireAdmin?: boolean;
+  requireOrderManagement?: boolean;
+  requiredPage?: PageKey | (string & {});
+}
+
+const ProtectedRoute: React.FC<ProtectedRouteProps> = ({
+  path,
+  component: Component,
+  requireInventoryAccess = false,
+  requireAdmin = false,
+  requireOrderManagement = false,
+  requiredPage,
+}) => {
+  const userPermissions = getCurrentUserPermissions();
+  const { user, isLoading } = useAuth();
+
+  return (
+    <Route path={path}>
+      {(params) => {
+        // While the session user is loading (every page refresh), show the page skeleton — this used
+        // to return nothing, which is the blank white area right after a manual refresh.
+        if (isLoading) return <PageSkeleton />;
+
+        if (requireAdmin && !userPermissions.canManageUsers) {
+          return <NotFound />;
+        }
+
+        if (requireInventoryAccess && !userPermissions.canAccessInventory) {
+          return <NotFound />;
+        }
+
+        // Page-based access control for non-admin users
+        let hasPageGrant = true;
+        if (requiredPage) {
+          const role = (user as any)?.role ?? '';
+          const isAdmin = role === 'admin' || role === 'super-admin';
+          if (!isAdmin) {
+            let allowedPages: string[] = [];
+            try {
+              allowedPages = JSON.parse((user as any)?.allowedPages || '[]');
+            } catch {
+              allowedPages = [];
+            }
+            hasPageGrant = allowedPages.includes(requiredPage);
+          }
+        }
+
+        // requireOrderManagement is an older, department-only gate. When combined with
+        // requiredPage on the same route, either one passing is enough (OR, not AND) —
+        // otherwise a page granted via User Management's Allowed Pages would still be
+        // blocked by this legacy check.
+        if (requireOrderManagement && !userPermissions.canAccessOrderManagement && !hasPageGrant) {
+          return <NotFound />;
+        }
+
+        if (requiredPage && !hasPageGrant) {
+          return <NotFound />;
+        }
+
+        return <Component {...params} />;
+      }}
+    </Route>
+  );
+};
+
+export default ProtectedRoute;

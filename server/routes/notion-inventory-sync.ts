@@ -1,0 +1,375 @@
+import { Router, Request, Response } from 'express';
+import path from 'path';
+import {
+  detectChangesFromNotion,
+  applyPendingChanges,
+  fullSyncFromNotion,
+  getPendingReport,
+  getSyncStatus,
+  getSyncHistory,
+  getAutoApplyEnabled,
+  setAutoApplyEnabled,
+  PRODUCT_IMAGE_DIR,
+} from '../services/notionInventorySync';
+import { storage } from '../storage';
+import { requirePageAccess, requirePageWrite } from '../lib/pageAccess';
+
+const router = Router();
+
+// Product Master is granted like any other page now (User Management > Allowed Pages / Write
+// Access) instead of being admin-only: reading needs the page, and every action that changes
+// products needs write on it. Admin and super-admin still pass both automatically.
+router.use('/notion-inventory-sync', requirePageAccess('notion-inventory'));
+const requireProductWrite = requirePageWrite('notion-inventory');
+
+function callerName(req: Request): string {
+  const u = req.user as any;
+  return u?.name || u?.username || u?.userCode || 'unknown';
+}
+
+// POST /api/notion-inventory-sync/detect  — body: { syncImages?: boolean }
+// syncImages defaults to false ("Sync Notion" — fast, data fields only). The client's "Sync
+// Photos" button is the only caller that passes true; Apply only ever touches images that a
+// syncImages:true run actually queued, so this default never risks Apply silently reverting
+// photos.
+router.post('/notion-inventory-sync/detect', requireProductWrite, async (req, res) => {
+  try {
+    const syncImages = req.body?.syncImages === true;
+    const report = await detectChangesFromNotion(callerName(req), syncImages);
+    res.json({ success: true, ...report });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Unknown error';
+    const status = message.includes('already in progress') ? 409 : 500;
+    res.status(status).json({ success: false, message });
+  }
+});
+
+// GET /api/notion-inventory-sync/pending
+router.get('/notion-inventory-sync/pending', (_req, res) => {
+  const report = getPendingReport();
+  if (!report) return res.json({ hasPending: false, report: null });
+  res.json({ hasPending: report.updated > 0 || report.created > 0, report });
+});
+
+// POST /api/notion-inventory-sync/apply
+router.post('/notion-inventory-sync/apply', requireProductWrite, async (_req, res) => {
+  try {
+    const report = await applyPendingChanges();
+    res.json({ success: true, ...report });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Unknown error';
+    const status = message.includes('already in progress') ? 409 : 500;
+    res.status(status).json({ success: false, message });
+  }
+});
+
+// POST /api/notion-inventory-sync/full-sync
+router.post('/notion-inventory-sync/full-sync', requireProductWrite, async (req, res) => {
+  try {
+    const report = await fullSyncFromNotion(callerName(req));
+    res.json({ success: true, ...report });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Unknown error';
+    const status = message.includes('already in progress') ? 409 : 500;
+    res.status(status).json({ success: false, message });
+  }
+});
+
+// GET /api/notion-inventory-sync/status
+router.get('/notion-inventory-sync/status', (_req, res) => {
+  res.json(getSyncStatus());
+});
+
+// GET /api/notion-inventory-sync/auto-apply-config
+// Whether the 24-hour scheduled sync is allowed to apply detected changes on its own.
+// Shared across everyone (single server-side setting), not a per-browser preference — readable by
+// anyone granted Product Master, changeable only with write access on it (see the router gates).
+router.get('/notion-inventory-sync/auto-apply-config', async (_req, res) => {
+  try {
+    res.json({ enabled: await getAutoApplyEnabled() });
+  } catch (err) {
+    res.status(500).json({ message: err instanceof Error ? err.message : 'Failed to read auto-apply setting' });
+  }
+});
+
+router.post('/notion-inventory-sync/auto-apply-config', requireProductWrite, async (req, res) => {
+  try {
+    const enabled = req.body?.enabled === true;
+    await setAutoApplyEnabled(enabled, callerName(req));
+    res.json({ enabled });
+  } catch (err) {
+    res.status(500).json({ message: err instanceof Error ? err.message : 'Failed to save auto-apply setting' });
+  }
+});
+
+// GET /api/notion-inventory-sync/inspect-properties
+// Returns the actual Notion property names in the inventory DB + a sample record's values.
+// Use this to debug why a field (e.g. brand) isn't syncing.
+router.get('/notion-inventory-sync/inspect-properties', async (_req, res) => {
+  try {
+    const { Client } = await import('@notionhq/client');
+    const notion = new Client({
+      auth: (process.env.NOTION_INTEGRATION_SECRET ?? process.env.NOTION_API_KEY ?? '').trim(),
+    });
+    const dbId = (process.env.NOTION_INVENTORY_DATABASE_ID ?? '').trim();
+    if (!dbId) return res.status(500).json({ error: 'NOTION_INVENTORY_DATABASE_ID not set' });
+
+    const [schema, sample] = await Promise.all([
+      notion.databases.retrieve({ database_id: dbId }),
+      notion.databases.query({ database_id: dbId, page_size: 1 }),
+    ]);
+
+    const propertySchema = Object.entries(schema.properties).map(([name, prop]: [string, any]) => ({
+      name,
+      type: prop.type,
+    }));
+
+    let sampleValues: Record<string, any> = {};
+    if (sample.results.length > 0) {
+      const page: any = sample.results[0];
+      for (const [key, prop] of Object.entries(page.properties) as [string, any][]) {
+        let val: any = null;
+        if (prop.type === 'title')        val = prop.title?.map((t: any) => t.plain_text).join('') || null;
+        else if (prop.type === 'rich_text') val = prop.rich_text?.map((t: any) => t.plain_text).join('') || null;
+        else if (prop.type === 'select')   val = prop.select?.name ?? null;
+        else if (prop.type === 'multi_select') val = prop.multi_select?.map((s: any) => s.name).join(', ') || null;
+        else if (prop.type === 'number')   val = prop.number;
+        else if (prop.type === 'status')   val = prop.status?.name ?? null;
+        else                              val = `(${prop.type})`;
+        sampleValues[key] = val;
+      }
+    }
+
+    res.json({ databaseId: dbId, properties: propertySchema, sampleRecord: sampleValues });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// GET /api/notion-inventory-sync/history
+router.get('/notion-inventory-sync/history', (_req, res) => {
+  res.json(getSyncHistory());
+});
+
+// ── CSV column header → DB field mapping ─────────────────────────────────────
+const CSV_HEADER_MAP: Record<string, string> = {
+  "New Sr.": "newSr", "SKU": "barcode", "Products Name": "name",
+  "Notion Wise Name": "notionWiseName", "Brand": "brand", "Category": "category",
+  "Sale Category": "saleCategory", "Plant": "plant", "Type": "type",
+  "Product Image": "productImage", "Vol Master": "volumeInCuFt", "Packets": "itemsPerPallet",
+  // CSV header text stays as-is (matches historical exports/imports) — only where the value
+  // lands changed, since pallet size is a per-state fact now (products.mpPlt/gjPlt).
+  "IND PLT": "mpPlt", "VAL PLT": "gjPlt",
+  "GJ Sr": "gjSr", "GJ HSN": "gjHsn", "GJ SAP": "gjSap",
+  "GJ Sale Rate": "gjSaleRate", "GJ IGST": "gjIgst",
+  "GJ-GA PUR": "gjGaPur", "GJ-MH PUR": "gjMhPur", "GJ-NAGAR PUR": "gjNagarPur",
+  "For GJ Order Form": "forGjOrderForm",
+  "MP Sr": "mpSr", "MP HSN": "mpHsn", "MP SAP": "mpSap",
+  "MP-JH PUR": "mpJhPur", "MP-MH PUR": "mpMhPur",
+  "MP-MP Jabalpur": "mpMpPurJabalpur", "MP-MP Khargone": "mpMpPurKhargone",
+  "MP-WB PUR": "mpWbPur", "Sale MP-JH": "saleMpJh", "Sale MP-MH": "saleMpMh",
+  "Sale MP-MP": "saleMpMp", "MP-JH IGST": "mpJhIgst", "MP-MH IGST": "mpMhIgst",
+  "MP-MP CGST": "mpMpCgst", "MP-MP SGST": "mpMpSgst",
+  "MP-WB IGST": "mpWbIgst", "MP-WB Sale": "mpWbSale",
+  "For MP Order Form": "forMpOrderForm",
+  "UP Sr": "upSr", "UP HSN": "upHsn", "UP SAP": "upSap",
+  "UP Rate": "upRate", "UP IGST": "upIgst", "For UP Order Form": "forUpOrderForm",
+};
+const INTEGER_FIELDS = new Set(["itemsPerPallet", "mpPlt", "gjPlt"]);
+
+// GET /api/products/image-by-name?name=...
+// Serves a product's locally-cached image (never the raw Notion URL — see
+// notionInventorySync.ts for why). Looked up by name rather than barcode because the
+// same barcode can be shared by multiple distinct products; the Scan page already
+// resolves scans down to one exact item name before it needs the picture.
+router.get('/products/image-by-name', async (req: Request, res: Response) => {
+  try {
+    if (!req.isAuthenticated || !req.isAuthenticated()) {
+      return res.status(401).json({ message: 'Not authenticated' });
+    }
+    const name = typeof req.query.name === 'string' ? req.query.name.trim() : '';
+    if (!name) return res.status(400).json({ message: 'name is required' });
+
+    const product = await storage.getProductByName(name);
+    if (!product?.productImage || !product.productImageHash) {
+      return res.status(404).json({ message: 'No image for this product' });
+    }
+
+    res.set({
+      // must-revalidate, not a plain max-age: the URL is the product's id, so it stays the same
+      // when the picture behind it changes. With "max-age=3600" the browser kept serving its own
+      // copy for an hour without asking, so a photo re-synced from Notion did not appear —
+      // looking exactly like the sync had failed. Revalidating every time costs one conditional
+      // request that answers 304 from the ETag below whenever the image really is unchanged.
+      'Cache-Control': 'public, max-age=0, must-revalidate',
+      'ETag': product.productImageHash,
+    });
+    if (req.headers['if-none-match'] === product.productImageHash) {
+      return res.status(304).end();
+    }
+
+    res.sendFile(path.join(PRODUCT_IMAGE_DIR, product.productImage), (err) => {
+      if (err && !res.headersSent) res.status(404).json({ message: 'Image file missing' });
+    });
+  } catch (err) {
+    res.status(500).json({ message: err instanceof Error ? err.message : 'Failed to serve product image' });
+  }
+});
+
+// GET /api/products/box-image-by-name?name=...
+// Same lookup as image-by-name above, reading box_image instead — the packed-carton photo for
+// whatever code path only has a bare item name yet (a CSV row not yet matched to a real product
+// id). Needed for parity with box-image-by-id, which only works once an id is known.
+router.get('/products/box-image-by-name', async (req: Request, res: Response) => {
+  try {
+    if (!req.isAuthenticated || !req.isAuthenticated()) {
+      return res.status(401).json({ message: 'Not authenticated' });
+    }
+    const name = typeof req.query.name === 'string' ? req.query.name.trim() : '';
+    if (!name) return res.status(400).json({ message: 'name is required' });
+
+    const product = await storage.getProductByName(name) as any;
+    if (!product?.boxImage || !product.boxImageHash) {
+      return res.status(404).json({ message: 'No box image for this product' });
+    }
+
+    res.set({
+      'Cache-Control': 'public, max-age=0, must-revalidate',
+      'ETag': product.boxImageHash,
+    });
+    if (req.headers['if-none-match'] === product.boxImageHash) {
+      return res.status(304).end();
+    }
+
+    res.sendFile(path.join(PRODUCT_IMAGE_DIR, product.boxImage), (err) => {
+      if (err && !res.headersSent) res.status(404).json({ message: 'Box image file missing' });
+    });
+  } catch (err) {
+    res.status(500).json({ message: err instanceof Error ? err.message : 'Failed to serve box image' });
+  }
+});
+
+// GET /api/products/image-by-id?id=...
+// Same as image-by-name above, but keyed on the product's own (stable, unique) primary key
+// instead of its name — immune to a product being renamed (a Notion resync, a typo fix), which
+// silently broke image-by-name's lookup even though the cached file itself never moved. Prefer
+// this everywhere a full Product row is already in hand; image-by-name stays as-is for the
+// scan-feedback popups that currently only have a bare item name (see notionPageId/productId
+// follow-up in server/routes/loading.ts's own /scan response for those).
+router.get('/products/image-by-id', async (req: Request, res: Response) => {
+  try {
+    if (!req.isAuthenticated || !req.isAuthenticated()) {
+      return res.status(401).json({ message: 'Not authenticated' });
+    }
+    const id = parseInt(String(req.query.id ?? ''), 10);
+    if (!Number.isFinite(id)) return res.status(400).json({ message: 'id is required' });
+
+    const product = await storage.getProduct(id);
+    if (!product?.productImage || !product.productImageHash) {
+      return res.status(404).json({ message: 'No image for this product' });
+    }
+
+    res.set({
+      // must-revalidate, not a plain max-age: the URL is the product's id, so it stays the same
+      // when the picture behind it changes. With "max-age=3600" the browser kept serving its own
+      // copy for an hour without asking, so a photo re-synced from Notion did not appear —
+      // looking exactly like the sync had failed. Revalidating every time costs one conditional
+      // request that answers 304 from the ETag below whenever the image really is unchanged.
+      'Cache-Control': 'public, max-age=0, must-revalidate',
+      'ETag': product.productImageHash,
+    });
+    if (req.headers['if-none-match'] === product.productImageHash) {
+      return res.status(304).end();
+    }
+
+    res.sendFile(path.join(PRODUCT_IMAGE_DIR, product.productImage), (err) => {
+      if (err && !res.headersSent) res.status(404).json({ message: 'Image file missing' });
+    });
+  } catch (err) {
+    res.status(500).json({ message: err instanceof Error ? err.message : 'Failed to serve product image' });
+  }
+});
+
+// GET /api/products/box-image-by-id?id=...
+// The packed-carton photo, alongside image-by-id above. Separate endpoint rather than a ?kind=
+// flag so the browser caches and revalidates each picture on its own ETag.
+router.get('/products/box-image-by-id', async (req: Request, res: Response) => {
+  try {
+    if (!req.isAuthenticated || !req.isAuthenticated()) {
+      return res.status(401).json({ message: 'Not authenticated' });
+    }
+    const id = parseInt(String(req.query.id ?? ''), 10);
+    if (!Number.isFinite(id)) return res.status(400).json({ message: 'id is required' });
+
+    const product = await storage.getProduct(id) as any;
+    if (!product?.boxImage || !product.boxImageHash) {
+      return res.status(404).json({ message: 'No box image for this product' });
+    }
+
+    res.set({
+      // must-revalidate, not a plain max-age: the URL is the product's id, so it stays the same
+      // when the picture behind it changes. With "max-age=3600" the browser kept serving its own
+      // copy for an hour without asking, so a photo re-synced from Notion did not appear —
+      // looking exactly like the sync had failed. Revalidating every time costs one conditional
+      // request that answers 304 from the ETag below whenever the image really is unchanged.
+      'Cache-Control': 'public, max-age=0, must-revalidate',
+      'ETag': product.boxImageHash,
+    });
+    if (req.headers['if-none-match'] === product.boxImageHash) {
+      return res.status(304).end();
+    }
+
+    res.sendFile(path.join(PRODUCT_IMAGE_DIR, product.boxImage), (err) => {
+      if (err && !res.headersSent) res.status(404).json({ message: 'Box image file missing' });
+    });
+  } catch (err) {
+    res.status(500).json({ message: err instanceof Error ? err.message : 'Failed to serve box image' });
+  }
+});
+
+// POST /api/products/csv-import
+router.post('/products/csv-import', requireProductWrite, async (req: Request, res: Response) => {
+  try {
+    const rows: Record<string, string>[] = req.body.rows;
+    if (!Array.isArray(rows) || rows.length === 0)
+      return res.status(400).json({ message: 'No rows provided' });
+
+    let created = 0, updated = 0, skipped = 0;
+    const errors: string[] = [];
+
+    for (let i = 0; i < rows.length; i++) {
+      const raw = rows[i];
+      try {
+        const mapped: Record<string, any> = {};
+        for (const [header, value] of Object.entries(raw)) {
+          const field = CSV_HEADER_MAP[header.trim()] ?? null;
+          if (!field || value === undefined || value === null) continue;
+          const v = String(value).trim();
+          if (v === '') continue;
+          mapped[field] = INTEGER_FIELDS.has(field) ? (parseInt(v) || 0) : v;
+        }
+
+        const barcode: string = mapped.barcode || '';
+        const name: string = mapped.name || '';
+        if (!barcode && !name) { skipped++; continue; }
+
+        const existing = barcode ? await storage.getProductByBarcode(barcode) : null;
+        if (existing) {
+          await storage.updateProduct(existing.id, mapped);
+          updated++;
+        } else {
+          await storage.createProduct({ barcode: barcode || '', name: name || '', ...mapped });
+          created++;
+        }
+      } catch (rowErr) {
+        errors.push(`Row ${i + 2}: ${rowErr instanceof Error ? rowErr.message : String(rowErr)}`);
+      }
+    }
+
+    res.json({ success: true, created, updated, skipped, errors, total: rows.length });
+  } catch (err) {
+    res.status(500).json({ message: err instanceof Error ? err.message : 'CSV import failed' });
+  }
+});
+
+export default router;
